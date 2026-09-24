@@ -1,0 +1,1 @@
+"""Server-side assistant drafts."""

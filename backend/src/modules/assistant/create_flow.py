@@ -777,6 +777,85 @@ def local_title(message):
     return text[0].upper() + text[1:]
 
 
+
+def _local_delete_target(message):
+    """
+    Extract the task name from an explicit delete command
+    without calling Gemini.
+
+    Examples:
+
+        Delete swim task
+            -> swim
+
+        Remove my Swimming reminder
+            -> Swimming
+
+        Delete task called Morning Exercise
+            -> Morning Exercise
+    """
+
+    raw = str(
+        message or ""
+    ).strip()
+
+    match = re.match(
+        r"^(?:please\s+)?"
+        r"(?:delete|remove)\s+"
+        r"(?:my\s+|the\s+)?"
+        r"(.+?)\s*$",
+        raw,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    target = (
+        match.group(1)
+        .strip(
+            " .,'\"“”"
+        )
+    )
+
+    # Example:
+    # "task called Swimming"
+    # -> "Swimming"
+    target = re.sub(
+        r"^(?:task|reminder|todo|to-do)"
+        r"\s+(?:called|named)\s+",
+        "",
+        target,
+        flags=re.IGNORECASE,
+    )
+
+    # Example:
+    # "swim task"
+    # -> "swim"
+    target = re.sub(
+        r"\s+(?:task|reminder|todo|to-do)$",
+        "",
+        target,
+        flags=re.IGNORECASE,
+    ).strip(
+        " .,'\"“”"
+    )
+
+    if (
+        not target
+        or target.lower()
+        in {
+            "task",
+            "reminder",
+            "it",
+            "this",
+            "that",
+        }
+    ):
+        return None
+
+    return target
+
 def local_intent(message, today):
     """
     Best-effort reading of a task request without Gemini.
@@ -787,6 +866,32 @@ def local_intent(message, today):
     """
 
     text = str(message or "").strip().lower()
+
+    # -----------------------------------------------------
+    # DELETE
+    # -----------------------------------------------------
+    #
+    # Explicit delete commands do not require Gemini.
+    #
+    # "Delete swim task"
+    #       ↓
+    # action = delete_task
+    # target_text = swim
+    #
+    delete_target = _local_delete_target(
+        message
+    )
+
+    if delete_target:
+        return {
+            "action":
+                "delete_task",
+
+            "arguments": {
+                "target_text":
+                    delete_target,
+            },
+        }
 
     if re.search(r"\b(show|list|what are|what's|how many)\b.*\btasks?\b", text):
         return {"action": "list_active_tasks", "arguments": {}}

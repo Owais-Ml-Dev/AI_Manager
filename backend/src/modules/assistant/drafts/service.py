@@ -410,7 +410,44 @@ def preview_task_draft(
             ):
                 intent = local_answer
 
-    # ---- 2. Gemini --------------------------------------------------------
+    # ---- 2. Explicit DELETE: deterministic -------------------------------
+    #
+    # A command such as:
+    #
+    #     Delete swim task
+    #
+    # is unambiguous enough that Gemini adds no value.
+    #
+    # Parse it locally and let the existing MongoDB matcher
+    # resolve the actual task.
+    #
+    # This also means Gemini outages cannot block deletion.
+    #
+    if (
+        intent is None
+        and not answering
+    ):
+        deterministic = local_intent(
+            message,
+            today,
+        )
+
+        if (
+            deterministic
+            and deterministic.get(
+                "action"
+            )
+            == "delete_task"
+        ):
+            intent = deterministic
+
+            provider = "local"
+
+            model = (
+                "deterministic parser"
+            )
+
+    # ---- 3. Gemini --------------------------------------------------------
     if intent is None:
         try:
             parsed = parse_task_message(

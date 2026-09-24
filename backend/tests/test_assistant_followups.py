@@ -235,3 +235,18 @@ def test_gemini_down_still_creates(app, monkeypatch):
 
     assert result["status"] in {"ready", "duplicate_review"}
     assert result["command"]["arguments"]["task"]["title"] == "Buy"
+
+
+
+def test_local_delete_intent_does_not_need_gemini():
+    intent = local_intent(
+        "Delete swim task",
+        TODAY,
+    )
+
+    assert intent == {
+        "action": "delete_task",
+        "arguments": {
+            "target_text": "swim",
+        },
+    }

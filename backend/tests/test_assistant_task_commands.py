@@ -215,3 +215,367 @@ def test_duplicate_matcher_uses_backend_tasks(client):
     matches = find_create_duplicates(command)
     assert matches
     assert matches[0]["title"] == "Drink water"
+
+
+def test_execute_delete_repeat_until_done_requires_confirmation(
+    client,
+    monkeypatch,
+):
+    db = get_db()
+    """
+    Delete through Assistant must:
+    1. resolve the existing task,
+    2. require confirmation,
+    3. delete only after confirmed=true.
+    """
+
+    from datetime import datetime, timezone
+
+    task_id = db.tasks.insert_one(
+        {
+            "task_type": "repeat_until_done",
+            "title": "Swimming",
+            "description": "Swimming task",
+            "priority": "not_important_not_urgent",
+            "duration": {
+                "start_date": "2026-09-24",
+                "end_date": "2026-10-24",
+            },
+            "repeat": {
+                "type": "everyday",
+                "custom_dates": [],
+            },
+            "reminders": [
+                {
+                    "start_time": "15:40",
+                    "end_time": "15:50",
+                    "count": 3,
+                    "generated_times": [
+                        "15:40",
+                        "15:45",
+                        "15:50",
+                    ],
+                }
+            ],
+            "status": "pending",
+            "reminders_cancelled": False,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    ).inserted_id
+
+    monkeypatch.setattr(
+        "src.modules.assistant.drafts.service.parse_task_message",
+        lambda **kwargs: {
+            "provider": "gemini",
+            "model": "test-model",
+            "intent": {
+                "action": "delete_task",
+                "arguments": {
+                    "target_text": "Swimming"
+                },
+            },
+        },
+    )
+
+    preview_response = client.post(
+        "/api/assistant/task-command/preview",
+        json={
+            "message": "Delete swimming task",
+            "timezone": "+05:30",
+        },
+        headers={
+            "X-Gemini-Api-Key": "test-key",
+        },
+    )
+
+    assert preview_response.status_code == 200
+
+    preview = preview_response.get_json()["data"]
+
+    assert preview["status"] == "ready"
+    assert (
+        preview["command"]["action"]
+        == "delete_repeat_until_done_task"
+    )
+
+    draft_id = preview["draft_id"]
+
+    # --------------------------------------------------
+    # NOT CONFIRMED -> MUST NOT DELETE
+    # --------------------------------------------------
+
+    response = client.post(
+        "/api/assistant/task-command/execute",
+        json={
+            "draft_id": draft_id,
+            "confirmed": False,
+        },
+    )
+
+    assert response.status_code == 409
+
+    assert (
+        db.tasks.find_one(
+            {"_id": task_id}
+        )
+        is not None
+    )
+
+    # --------------------------------------------------
+    # CONFIRMED -> DELETE
+    # --------------------------------------------------
+
+    response = client.post(
+        "/api/assistant/task-command/execute",
+        json={
+            "draft_id": draft_id,
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+
+    assert (
+        db.tasks.find_one(
+            {"_id": task_id}
+        )
+        is None
+    )
+
+
+def test_execute_delete_recurring_removes_occurrences(
+    client,
+    monkeypatch,
+):
+    db = get_db()
+    """
+    Deleting a recurring task through Assistant must also
+    delete its occurrence documents.
+    """
+
+    from datetime import datetime, timezone
+
+    task_id = db.tasks.insert_one(
+        {
+            "task_type": "recurring",
+            "title": "Morning Exercise",
+            "description": "Exercise every morning",
+            "priority": "important_not_urgent",
+            "duration": {
+                "start_date": "2026-09-24",
+                "end_date": "2026-10-24",
+            },
+            "repeat": {
+                "type": "everyday",
+                "custom_dates": [],
+            },
+            "reminders": [
+                {
+                    "start_time": "07:00",
+                    "end_time": "08:00",
+                    "count": 1,
+                    "generated_times": [
+                        "07:00"
+                    ],
+                }
+            ],
+            "status": "active",
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    ).inserted_id
+
+    occurrence_id = db.task_occurrences.insert_one(
+        {
+            "task_id": task_id,
+            "scheduled_date": "2026-09-24",
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    ).inserted_id
+
+    monkeypatch.setattr(
+        "src.modules.assistant.drafts.service.parse_task_message",
+        lambda **kwargs: {
+            "provider": "gemini",
+            "model": "test-model",
+            "intent": {
+                "action": "delete_task",
+                "arguments": {
+                    "target_text": "Morning Exercise"
+                },
+            },
+        },
+    )
+
+    preview_response = client.post(
+        "/api/assistant/task-command/preview",
+        json={
+            "message": "Delete morning exercise task",
+            "timezone": "+05:30",
+        },
+        headers={
+            "X-Gemini-Api-Key": "test-key",
+        },
+    )
+
+    assert preview_response.status_code == 200
+
+    preview = preview_response.get_json()["data"]
+
+    assert preview["status"] == "ready"
+
+    assert (
+        preview["command"]["action"]
+        == "delete_recurring_task"
+    )
+
+    response = client.post(
+        "/api/assistant/task-command/execute",
+        json={
+            "draft_id": preview["draft_id"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+
+    assert (
+        db.tasks.find_one(
+            {"_id": task_id}
+        )
+        is None
+    )
+
+    assert (
+        db.task_occurrences.find_one(
+            {"_id": occurrence_id}
+        )
+        is None
+    )
+
+
+
+def test_delete_preview_bypasses_gemini(
+    client,
+    monkeypatch,
+):
+    """
+    A clear delete command must work even when Gemini is
+    unavailable because delete intent parsing is deterministic.
+    """
+
+    from datetime import datetime, timezone
+
+    db = get_db()
+
+    task_id = db.tasks.insert_one(
+        {
+            "task_type":
+                "repeat_until_done",
+
+            "title":
+                "Swim",
+
+            "description":
+                "Swimming task",
+
+            "priority":
+                "not_important_not_urgent",
+
+            "duration": {
+                "start_date":
+                    "2026-09-24",
+
+                "end_date":
+                    "2026-10-24",
+            },
+
+            "repeat": {
+                "type":
+                    "everyday",
+
+                "custom_dates":
+                    [],
+            },
+
+            "reminders":
+                [],
+
+            "status":
+                "pending",
+
+            "reminders_cancelled":
+                False,
+
+            "created_at":
+                datetime.now(
+                    timezone.utc
+                ),
+
+            "updated_at":
+                datetime.now(
+                    timezone.utc
+                ),
+        }
+    ).inserted_id
+
+    def gemini_must_not_run(
+        **kwargs,
+    ):
+        raise AssertionError(
+            "Gemini must not be called "
+            "for an explicit delete command."
+        )
+
+    monkeypatch.setattr(
+        "src.modules.assistant.drafts."
+        "service.parse_task_message",
+        gemini_must_not_run,
+    )
+
+    response = client.post(
+        "/api/assistant/task-command/preview",
+        json={
+            "message":
+                "Delete swim task",
+
+            "timezone":
+                "+05:30",
+        },
+    )
+
+    assert (
+        response.status_code
+        == 200
+    )
+
+    data = (
+        response
+        .get_json()["data"]
+    )
+
+    assert (
+        data["status"]
+        == "ready"
+    )
+
+    assert (
+        data["command"]["action"]
+        == "delete_repeat_until_done_task"
+    )
+
+    assert (
+        data["command"]
+        ["arguments"]
+        ["task_id"]
+        == str(task_id)
+    )
+
+    assert (
+        data["command"]
+        ["requires_confirmation"]
+        is True
+    )

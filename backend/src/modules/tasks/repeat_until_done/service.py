@@ -54,6 +54,9 @@ def serialize_repeat_until_done_task(task):
         "priority":
             task["priority"],
 
+        "duration":
+            task.get("duration"),
+
         # Repeat configuration.
         #
         # New model:
@@ -174,6 +177,11 @@ def create_repeat_until_done_task(data):
 
         "priority":
             data["priority"],
+
+        "duration": {
+            "start_date": data["duration"]["start_date"],
+            "end_date": data["duration"]["end_date"],
+        },
 
         # Store repeat configuration.
         #
@@ -386,6 +394,16 @@ def update_repeat_until_done_task(
         update_data["priority"] = (
             data["priority"]
         )
+
+    # -----------------------------------------------------
+    # DURATION
+    # -----------------------------------------------------
+
+    if "duration" in data:
+        update_data["duration"] = {
+            "start_date": data["duration"]["start_date"],
+            "end_date": data["duration"]["end_date"],
+        }
 
     # -----------------------------------------------------
     # REPEAT

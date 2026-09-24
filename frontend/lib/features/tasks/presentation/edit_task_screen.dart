@@ -102,9 +102,9 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
 
       _loadReminders(task['reminders']);
 
-      if (widget.recurring) {
-        _loadDuration(task['duration']);
-      }
+      _loadDuration(
+        task['duration'],
+      );
 
       if (!mounted) {
         return;
@@ -320,7 +320,7 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
               decoration: InputDecoration(hintText: 'Task description'),
             ),
 
-            if (widget.recurring) ...[
+            ...[
               SizedBox(height: 26),
 
               _sectionTitle('Duration'),
@@ -869,19 +869,9 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
     DateTime lastDate;
     DateTime initialDate;
 
-    if (widget.recurring) {
-      firstDate = _startDate;
-      lastDate = _endDate;
-      initialDate = _startDate;
-    } else {
-      final today = DateTime.now();
-
-      firstDate = DateTime(today.year, today.month, today.day);
-
-      lastDate = firstDate.add(Duration(days: 3650));
-
-      initialDate = firstDate;
-    }
+    firstDate = _startDate;
+    lastDate = _endDate;
+    initialDate = _startDate;
 
     final date = await showDatePicker(
       context: context,
@@ -913,10 +903,6 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
   }
 
   void _removeDatesOutsideDuration() {
-    if (!widget.recurring) {
-      return;
-    }
-
     _customDates.removeWhere(
       (date) => date.isBefore(_startDate) || date.isAfter(_endDate),
     );
@@ -929,7 +915,7 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
       return false;
     }
 
-    if (widget.recurring && _endDate.isBefore(_startDate)) {
+    if (_endDate.isBefore(_startDate)) {
       _showMessage('End date cannot be before start date.');
 
       return false;
@@ -991,13 +977,16 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
       }).toList(),
     };
 
-    if (widget.recurring) {
-      payload['duration'] = {
-        'start_date': DateFormat('yyyy-MM-dd').format(_startDate),
-
-        'end_date': DateFormat('yyyy-MM-dd').format(_endDate),
-      };
-    }
+    payload['duration'] = {
+      'start_date':
+          DateFormat('yyyy-MM-dd').format(
+        _startDate,
+      ),
+      'end_date':
+          DateFormat('yyyy-MM-dd').format(
+        _endDate,
+      ),
+    };
 
     try {
       final repository = ref.read(taskRepositoryProvider);

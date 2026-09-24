@@ -3,6 +3,7 @@ def valid_payload():
         "title": "Pay electricity bill",
         "description": "Keep reminding until completed",
         "priority": "important_urgent",
+        "duration": {"start_date": "2099-09-01", "end_date": "2099-09-30"},
         "repeat": {
             "type": "custom_dates",
             "custom_dates": [

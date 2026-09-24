@@ -208,41 +208,42 @@ def update_repeat_until_done_task_controller(
                 "Request body is required."
         }), 400
 
-    # Validate the partial update.
-    errors = (
-        validate_update_repeat_until_done_task(
-            data
-        )
+    try:
+        current_task = get_repeat_until_done_task(task_id)
+    except InvalidId:
+        return jsonify({
+            "success": False,
+            "message": "Invalid task ID."
+        }), 400
+
+    if current_task is None:
+        return jsonify({
+            "success": False,
+            "message": "Repeat Until Done task not found."
+        }), 404
+
+    if current_task.get("status") == "completed":
+        return jsonify({
+            "success": False,
+            "message": "Completed Repeat Until Done tasks cannot be updated."
+        }), 409
+
+    errors = validate_update_repeat_until_done_task(
+        data,
+        current_task
     )
 
     if errors:
         return jsonify({
-            "success":
-                False,
-
-            "message":
-                "Validation failed.",
-
-            "errors":
-                errors
+            "success": False,
+            "message": "Validation failed.",
+            "errors": errors,
         }), 400
 
-    try:
-        result = (
-            update_repeat_until_done_task(
-                task_id,
-                data
-            )
-        )
-
-    except InvalidId:
-        return jsonify({
-            "success":
-                False,
-
-            "message":
-                "Invalid task ID."
-        }), 400
+    result = update_repeat_until_done_task(
+        task_id,
+        data
+    )
 
     if result == "not_found":
         return jsonify({

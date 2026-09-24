@@ -104,7 +104,10 @@ class HomeRepository {
     final result = <HomeTaskItem>[];
 
     for (final task in active) {
-      if (!_isDueToday(task['repeat'])) {
+      if (!_isDueToday(
+        task['repeat'],
+        task['duration'],
+      )) {
         continue;
       }
 
@@ -162,12 +165,64 @@ class HomeRepository {
     return result;
   }
 
-  bool _isDueToday(dynamic rawRepeat) {
-    final repeat = _asMap(rawRepeat);
+  bool _isDueToday(
+    dynamic rawRepeat,
+    dynamic rawDuration,
+  ) {
+    final repeat = _asMap(
+      rawRepeat,
+    );
 
-    final type = repeat['type']?.toString();
+    final duration = _asMap(
+      rawDuration,
+    );
+
+    final type =
+        repeat['type']?.toString();
 
     final now = DateTime.now();
+
+    final today = DateTime(
+      now.year,
+      now.month,
+      now.day,
+    );
+
+    final start = DateTime.tryParse(
+      duration['start_date']
+              ?.toString() ??
+          '',
+    );
+
+    final end = DateTime.tryParse(
+      duration['end_date']
+              ?.toString() ??
+          '',
+    );
+
+    if (start != null) {
+      final startDate = DateTime(
+        start.year,
+        start.month,
+        start.day,
+      );
+
+      if (today.isBefore(startDate)) {
+        return false;
+      }
+    }
+
+    if (end != null) {
+      final endDate = DateTime(
+        end.year,
+        end.month,
+        end.day,
+      );
+
+      if (today.isAfter(endDate)) {
+        return false;
+      }
+    }
 
     switch (type) {
       case 'everyday':
@@ -181,7 +236,12 @@ class HomeRepository {
             now.weekday == DateTime.sunday;
 
       case 'custom_dates':
-        final today = DateFormat('yyyy-MM-dd').format(now);
+        final todayText =
+            DateFormat(
+          'yyyy-MM-dd',
+        ).format(
+          now,
+        );
 
         final dates = repeat['custom_dates'];
 
@@ -189,7 +249,14 @@ class HomeRepository {
           return false;
         }
 
-        return dates.map((date) => date.toString()).contains(today);
+        return dates
+            .map(
+              (date) =>
+                  date.toString(),
+            )
+            .contains(
+              todayText,
+            );
 
       default:
         return false;

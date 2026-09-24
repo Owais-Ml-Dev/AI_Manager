@@ -47,6 +47,78 @@ CREATE_ACTIONS = {"create_repeat_until_done_task", "create_recurring_task"}
 MAX_WINDOWS = 5
 
 
+def explicit_task_action(text):
+    """
+    Return a create action only when the user explicitly
+    specifies the task type.
+
+    Example:
+        "Add swimming task"
+            -> None
+
+        "Add recurring swimming task"
+            -> create_recurring_task
+
+        "Add repeat until done swimming task"
+            -> create_repeat_until_done_task
+    """
+
+    value = str(
+        text or ""
+    ).strip().lower()
+
+    if re.search(
+        r"\b("
+        r"repeat[- ]?until[- ]?done"
+        r"|until done"
+        r"|one[- ]?time"
+        r")\b",
+        value,
+    ):
+        return (
+            "create_repeat_until_done_task"
+        )
+
+    if re.search(
+        r"\b("
+        r"recurring"
+        r"|repeating"
+        r"|habit"
+        r"|routine"
+        r")\b"
+        r"|\bdaily\s+task\b",
+        value,
+    ):
+        return (
+            "create_recurring_task"
+        )
+
+    return None
+
+
+def selected_create_action(
+    action,
+    collect,
+):
+    """
+    Return the task type explicitly selected by the user.
+
+    Gemini's original classification is only provisional
+    until the user confirms the type.
+    """
+
+    selected = (
+        collect or {}
+    ).get(
+        "selected_task_action"
+    )
+
+    if selected in CREATE_ACTIONS:
+        return selected
+
+    return action
+
+
 # =========================================================
 # FORMATTING HELPERS
 # =========================================================
@@ -148,12 +220,39 @@ def next_step(action, task, collect):
             "suggestions": [],
         }
 
+    # -----------------------------------------------------
+    # TASK TYPE
+    # -----------------------------------------------------
+    #
+    # Gemini may provisionally classify a create request,
+    # but we do not silently decide between:
+    #
+    #   Recurring
+    #   Repeat Until Done
+    #
+    # unless the user explicitly stated the type.
+    #
+    if not collect.get(
+        "task_type_confirmed"
+    ):
+        return {
+            "field": "task_type",
+            "question": (
+                "What type of task is this: "
+                "Recurring or Repeat Until Done?"
+            ),
+            "suggestions": [
+                "Recurring",
+                "Repeat Until Done",
+            ],
+        }
+
     duration = task.get("duration") if isinstance(task.get("duration"), dict) else {}
     start = duration.get("start_date")
     end = duration.get("end_date")
 
-    # ---- 1. Dates (recurring only) -----------------------------------
-    if action == "create_recurring_task":
+    # ---- 1. Dates (both task types) ----------------------------------
+    if action in CREATE_ACTIONS:
         if not start and not end:
             return {
                 "field": "duration",
@@ -182,16 +281,10 @@ def next_step(action, task, collect):
     # ---- 2. Repeat ------------------------------------------------------
     repeat = task.get("repeat") if isinstance(task.get("repeat"), dict) else {}
     if not repeat.get("type"):
-        if action == "create_recurring_task":
-            question = (
-                f"How should it repeat between {_pretty_date(start)} and "
-                f"{_pretty_date(end)}: every day, weekdays, weekends, or custom dates?"
-            )
-        else:
-            question = (
-                "How often should I remind you until it's done: every day, "
-                "weekdays, weekends, or custom dates?"
-            )
+        question = (
+            f"How should it repeat between {_pretty_date(start)} and "
+            f"{_pretty_date(end)}: every day, weekdays, weekends, or custom dates?"
+        )
         return {
             "field": "repeat",
             "question": question,
@@ -200,9 +293,8 @@ def next_step(action, task, collect):
 
     if repeat.get("type") == "custom_dates" and not repeat.get("custom_dates"):
         where = (
-            f" (between {_pretty_date(start)} and {_pretty_date(end)})"
-            if action == "create_recurring_task"
-            else ""
+            f" (between {_pretty_date(start)} "
+            f"and {_pretty_date(end)})"
         )
         return {
             "field": "repeat.custom_dates",
@@ -230,7 +322,26 @@ def next_step(action, task, collect):
             "suggestions": ["1", "2", "3"],
         }
 
-    # ---- 5. Start and end time for each window --------------------------
+    # ---- 5. Reminder count inside each entered window -----------------
+    confirmed_counts = int(
+        collect.get("confirmed_window_counts") or 0
+    )
+
+    if confirmed_counts < len(windows):
+        number = confirmed_counts + 1
+        window = windows[confirmed_counts]
+
+        return {
+            "field": "reminders.window_reminder_count",
+            "question": (
+                f"How many reminders should I send in reminder window {number} "
+                f"({_pretty_time(window.get('start_time'))} - "
+                f"{_pretty_time(window.get('end_time'))})? (1 to 20)"
+            ),
+            "suggestions": ["1", "2", "3"],
+        }
+
+    # ---- 6. Start and end time for next window ---------------------------
     if count and len(windows) < count:
         number = len(windows) + 1
         prefix = (
@@ -249,6 +360,11 @@ def next_step(action, task, collect):
 
 RETRY_QUESTIONS = {
     "title": "I still need a name for this task. Just type the name, for example: Buy groceries.",
+
+    "task_type": (
+        "Please choose the task type: "
+        "Recurring or Repeat Until Done."
+    ),
     "duration": (
         "Sorry, I didn't get the dates. Try: \"from 25 Sep to 10 Oct\", "
         "\"today for 2 weeks\", or \"starting tomorrow for 30 days\"."
@@ -265,6 +381,10 @@ RETRY_QUESTIONS = {
     "reminders.window": (
         "Sorry, I didn't get the times. Give a start and end time with AM/PM, "
         "for example: 9 am to 11 am, or 18:00 to 19:30."
+    ),
+    "reminders.window_reminder_count": (
+        "How many reminders should I send in this window? "
+        "Reply with a number from 1 to 20."
     ),
 }
 
@@ -324,12 +444,70 @@ def apply_answer(field, action, task, collect, reply, today):
     understood = False
 
     if field == "title":
-        title = extract_title(reply)
+        title = extract_title(
+            reply
+        )
+
         if title:
             task["title"] = title
             understood = True
 
-    elif field in ("duration", "duration.start_date", "duration.end_date"):
+    elif field == "task_type":
+
+        selected = (
+            explicit_task_action(
+                reply
+            )
+        )
+
+        value = str(
+            reply or ""
+        ).strip().lower()
+
+        # Because we explicitly asked:
+        #
+        # "Recurring or Repeat Until Done?"
+        #
+        # short answers can safely be interpreted here.
+
+        if selected is None and value in {
+            "recurring",
+            "daily",
+            "repeating",
+            "habit",
+            "routine",
+        }:
+            selected = (
+                "create_recurring_task"
+            )
+
+        elif selected is None and value in {
+            "repeat until done",
+            "until done",
+            "one time",
+            "one-time",
+        }:
+            selected = (
+                "create_repeat_until_done_task"
+            )
+
+        if selected in CREATE_ACTIONS:
+
+            collect[
+                "selected_task_action"
+            ] = selected
+
+            collect[
+                "task_type_confirmed"
+            ] = True
+
+            understood = True
+
+    elif field in (
+        "duration",
+        "duration.start_date",
+        "duration.end_date",
+    ):
         duration = dict(task.get("duration") or {})
 
         if field == "duration.start_date":
@@ -421,12 +599,51 @@ def apply_answer(field, action, task, collect, reply, today):
                 understood = True
 
     elif field == "reminders.window":
-        windows, ambiguous = parse_reminder_windows(reply, lenient=True)
+        windows, ambiguous = parse_reminder_windows(
+            reply,
+            lenient=True
+        )
+
         if ambiguous:
-            _hold_for_meridiem(collect, reply, True)
+            _hold_for_meridiem(
+                collect,
+                reply,
+                True
+            )
             understood = True
+
         elif windows:
-            _set_windows(task, collect, windows)
+            _set_windows(
+                task,
+                collect,
+                windows
+            )
+            understood = True
+
+    elif field == "reminders.window_reminder_count":
+        count_value = extract_count(reply)
+
+        confirmed_counts = int(
+            collect.get("confirmed_window_counts") or 0
+        )
+
+        windows = _windows(task)
+
+        if (
+            count_value
+            and confirmed_counts < len(windows)
+        ):
+            windows[confirmed_counts]["count"] = min(
+                count_value,
+                20
+            )
+
+            task["reminders"] = windows
+
+            collect["confirmed_window_counts"] = (
+                confirmed_counts + 1
+            )
+
             understood = True
 
     if understood:
@@ -452,10 +669,49 @@ def prefill_from_message(action, task, collect, message, today):
     refuse to trust any time that was missing AM/PM.
     """
 
-    task = deepcopy(task) if isinstance(task, dict) else {}
-    collect = dict(collect or {})
+    task = (
+        deepcopy(task)
+        if isinstance(
+            task,
+            dict
+        )
+        else {}
+    )
 
-    windows, ambiguous = parse_reminder_windows(message)
+    collect = dict(
+        collect or {}
+    )
+
+    # If the user explicitly says the task type in the
+    # first message, do not ask again.
+    #
+    # Examples:
+    #
+    # "Create recurring swimming task"
+    #
+    # "Create repeat until done swimming task"
+    #
+    explicit_action = (
+        explicit_task_action(
+            message
+        )
+    )
+
+    if explicit_action in CREATE_ACTIONS:
+
+        collect[
+            "selected_task_action"
+        ] = explicit_action
+
+        collect[
+            "task_type_confirmed"
+        ] = True
+
+    windows, ambiguous = (
+        parse_reminder_windows(
+            message
+        )
+    )
     if ambiguous:
         # Gemini had to guess AM or PM for something like "at 4:22".
         # Drop the guess and ask.
@@ -464,9 +720,6 @@ def prefill_from_message(action, task, collect, message, today):
         _hold_for_meridiem(collect, message, False)
 
     task = fill_gaps(task, extract_task_fields(message, today), action)
-
-    if action != "create_recurring_task":
-        task.pop("duration", None)
 
     if _windows(task) and collect.get("window_count") is None:
         collect["window_count"] = len(_windows(task))

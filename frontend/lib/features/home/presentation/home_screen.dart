@@ -10,6 +10,7 @@ import '../domain/home_task_item.dart';
 import '../../tasks/application/task_providers.dart';
 import '../../tasks/presentation/new_task_screen.dart';
 import '../../tasks/presentation/edit_task_screen.dart';
+import '../../tasks/presentation/recurring_task_detail_screen.dart';
 import '../../profile/presentation/profile_screen.dart';
 import '../../settings/presentation/settings_screen.dart';
 import '../../notifications/presentation/notifications_screen.dart';
@@ -234,6 +235,24 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ...tasks.map(
             (task) => _TaskRow(
               task: task,
+              onTap: task.kind == HomeTaskKind.recurring
+                  ? () async {
+                      await Navigator.push<bool>(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) {
+                            return RecurringTaskDetailScreen(
+                              taskId: task.taskId,
+                            );
+                          },
+                        ),
+                      );
+
+                      if (mounted) {
+                        ref.invalidate(homeDataProvider);
+                      }
+                    }
+                  : null,
               onMore: task.status == HomeTaskStatus.pending
                   ? () {
                       _showTaskActions(
@@ -559,9 +578,10 @@ class _TaskTabButton extends StatelessWidget {
 
 class _TaskRow extends StatelessWidget {
   final HomeTaskItem task;
+  final VoidCallback? onTap;
   final VoidCallback? onMore;
 
-  const _TaskRow({required this.task, this.onMore});
+  const _TaskRow({required this.task, this.onTap, this.onMore});
 
   Color get _priorityColor {
     switch (task.priority) {
@@ -581,68 +601,83 @@ class _TaskRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: EdgeInsets.symmetric(vertical: 15),
-      decoration: BoxDecoration(
-        border: Border(bottom: BorderSide(color: AppColors.of(context).border)),
-      ),
-      child: Row(
-        children: [
-          _StatusCircle(status: task.status),
-
-          SizedBox(width: 12),
-
-          Container(
-            width: 7,
-            height: 7,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: _priorityColor,
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 15),
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(color: AppColors.of(context).border),
             ),
           ),
+          child: Row(
+            children: [
+              _StatusCircle(status: task.status),
 
-          SizedBox(width: 12),
+              const SizedBox(width: 12),
 
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  task.title,
-                  style: TextStyle(
-                    color: task.isCompleted
-                        ? AppColors.of(context).textSecondary
-                        : AppColors.of(context).textPrimary,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w600,
-                    decoration: task.isCompleted
-                        ? TextDecoration.lineThrough
-                        : null,
-                  ),
+              Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _priorityColor,
+                ),
+              ),
+
+              const SizedBox(width: 12),
+
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      task.title,
+                      style: TextStyle(
+                        color: task.isCompleted
+                            ? AppColors.of(context).textSecondary
+                            : AppColors.of(context).textPrimary,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                        decoration: task.isCompleted
+                            ? TextDecoration.lineThrough
+                            : null,
+                      ),
+                    ),
+
+                    const SizedBox(height: 3),
+
+                    Text(
+                      task.subtitle,
+                      style: TextStyle(
+                        color: task.isMissed
+                            ? AppColors.red
+                            : AppColors.of(context).textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+
+              if (task.kind == HomeTaskKind.recurring)
+                Icon(
+                  Icons.chevron_right,
+                  size: 18,
+                  color: AppColors.of(context).textMuted,
                 ),
 
-                SizedBox(height: 3),
-
-                Text(
-                  task.subtitle,
-                  style: TextStyle(
-                    color: task.isMissed
-                        ? AppColors.red
-                        : AppColors.of(context).textSecondary,
-                    fontSize: 12,
-                  ),
+              if (onMore != null)
+                IconButton(
+                  onPressed: onMore,
+                  icon: const Icon(Icons.more_vert, size: 18),
+                  color: AppColors.of(context).textMuted,
                 ),
-              ],
-            ),
+            ],
           ),
-
-          if (onMore != null)
-            IconButton(
-              onPressed: onMore,
-              icon: Icon(Icons.more_vert, size: 18),
-              color: AppColors.of(context).textMuted,
-            ),
-        ],
+        ),
       ),
     );
   }

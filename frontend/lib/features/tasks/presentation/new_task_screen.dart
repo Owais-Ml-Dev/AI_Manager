@@ -125,7 +125,7 @@ class _NewTaskScreenState extends ConsumerState<NewTaskScreen> {
                 decoration: InputDecoration(hintText: 'Add some details'),
               ),
 
-              if (_taskType == NewTaskType.recurring) ...[
+              ...[
                 SizedBox(height: 26),
 
                 _sectionTitle('Duration'),
@@ -797,13 +797,8 @@ class _NewTaskScreenState extends ConsumerState<NewTaskScreen> {
   }
 
   Future<void> _addCustomDate() async {
-    final firstDate = _taskType == NewTaskType.recurring
-        ? _startDate
-        : DateTime.now();
-
-    final lastDate = _taskType == NewTaskType.recurring
-        ? _endDate
-        : DateTime.now().add(Duration(days: 3650));
+    final firstDate = _startDate;
+    final lastDate = _endDate;
 
     final date = await showDatePicker(
       context: context,
@@ -884,10 +879,6 @@ class _NewTaskScreenState extends ConsumerState<NewTaskScreen> {
   }
 
   void _removeCustomDatesOutsideDuration() {
-    if (_taskType != NewTaskType.recurring) {
-      return;
-    }
-
     _customDates.removeWhere(
       (date) => date.isBefore(_startDate) || date.isAfter(_endDate),
     );
@@ -921,6 +912,13 @@ class _NewTaskScreenState extends ConsumerState<NewTaskScreen> {
     if (_titleController.text.trim().isEmpty) {
       _showMessage('Enter a task title.');
 
+      return false;
+    }
+
+    if (_endDate.isBefore(_startDate)) {
+      _showMessage(
+        'End date cannot be before start date.',
+      );
       return false;
     }
 
@@ -986,13 +984,16 @@ class _NewTaskScreenState extends ConsumerState<NewTaskScreen> {
       'reminders': reminders,
     };
 
-    if (_taskType == NewTaskType.recurring) {
-      payload['duration'] = {
-        'start_date': DateFormat('yyyy-MM-dd').format(_startDate),
-
-        'end_date': DateFormat('yyyy-MM-dd').format(_endDate),
-      };
-    }
+    payload['duration'] = {
+      'start_date':
+          DateFormat('yyyy-MM-dd').format(
+        _startDate,
+      ),
+      'end_date':
+          DateFormat('yyyy-MM-dd').format(
+        _endDate,
+      ),
+    };
 
     try {
       final repository = ref.read(taskRepositoryProvider);

@@ -25,8 +25,16 @@ action:
   in task.
 - list_active_tasks: the user wants to see their tasks.
 - unknown: not about tasks.
-If the message answers QUESTION THE USER IS ANSWERING, or only adds details,
-use the action from CURRENT DRAFT.
+
+For a create request that does NOT explicitly say
+Recurring or Repeat Until Done, choose the most likely
+create action only as a provisional parse.
+
+The backend will ask the user to explicitly choose the
+task type before creating anything.
+
+If the message answers QUESTION THE USER IS ANSWERING,
+or only adds details, use the action from CURRENT DRAFT.
 
 For create actions ALWAYS write:
 - title: a clear, short name (2-5 words), capitalised. "add buy task" ->
@@ -39,7 +47,8 @@ Other task fields (only when the user states them):
 - repeat_type: everyday | weekdays | weekends | custom_dates.
   "every day", "daily", "everyday" -> everyday.
 - custom_dates: YYYY-MM-DD list, only when repeat_type is custom_dates.
-- start_date / end_date: YYYY-MM-DD. "for 7 days" starting today means
+- start_date / end_date: YYYY-MM-DD for BOTH create_recurring_task and
+  create_repeat_until_done_task. "for 7 days" starting today means
   end_date = today + 6 days. Use TODAY for relative dates.
 - reminders: 24-hour HH:MM. One time such as 7 PM ->
   {"start_time":"19:00","end_time":"19:01","count":1}.

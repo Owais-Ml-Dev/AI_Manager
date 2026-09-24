@@ -33,6 +33,10 @@ class TaskRepository {
     return _apiClient.get('/api/tasks/recurring/$taskId');
   }
 
+  Future<dynamic> getRecurringTaskDetails(String taskId) {
+    return _apiClient.get('/api/tasks/recurring/$taskId/details');
+  }
+
   Future<dynamic> getRepeatUntilDoneTask(String taskId) {
     return _apiClient.get('/api/tasks/repeat-until-done/$taskId');
   }

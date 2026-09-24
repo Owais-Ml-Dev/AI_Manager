@@ -16,6 +16,7 @@ def repeat_task_payload(title="Pay electricity bill"):
         "title": title,
         "description": "",
         "priority": "important_urgent",
+        "duration": {"start_date": "2099-01-01", "end_date": "2099-12-31"},
         "repeat": {"type": "everyday", "custom_dates": []},
         "reminders": [
             {
@@ -111,10 +112,11 @@ def test_backend_not_gemini_decides_missing_fields():
         }
     )
 
-    # One question at a time, in the fixed order: dates come first for a
-    # recurring task.
+    # Task type must be explicitly confirmed before collecting
+    # the remaining task details. Gemini's create action is only
+    # treated as a provisional classification.
     assert preview["status"] == "needs_input"
-    assert preview["missing_fields"] == ["duration"]
+    assert preview["missing_fields"] == ["task_type"]
 
 
 def test_execute_create_requires_confirmation(client):

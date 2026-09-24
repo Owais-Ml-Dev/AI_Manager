@@ -36,6 +36,7 @@ from src.modules.assistant.create_flow import (
     apply_answer,
     local_intent,
     prefill_from_message,
+    selected_create_action,
 )
 from src.modules.assistant.task_parser import (
     TaskParserError,
@@ -117,8 +118,6 @@ def _merge_intent(current, incoming, answering=False):
     # made the assistant ask the same question again.
     if current_action in CREATE_ACTIONS and incoming_action in CREATE_ACTIONS:
         task = _deep_merge(_task_of(current), _task_of(incoming))
-        if incoming_action != "create_recurring_task":
-            task.pop("duration", None)
         collect = deepcopy((current.get("arguments") or {}).get("collect") or {})
         return {
             "action": incoming_action,
@@ -385,8 +384,30 @@ def preview_task_draft(
             today,
         )
         if understood:
-            local_answer = _with_task(current_intent, task, collect)
-            if len(message.split()) <= SHORT_REPLY_WORDS:
+
+            resolved_action = (
+                selected_create_action(
+                    current_action,
+                    collect,
+                )
+            )
+
+            local_answer = _with_task(
+                {
+                    **current_intent,
+                    "action":
+                        resolved_action,
+                },
+                task,
+                collect,
+            )
+
+            if (
+                len(
+                    message.split()
+                )
+                <= SHORT_REPLY_WORDS
+            ):
                 intent = local_answer
 
     # ---- 2. Gemini --------------------------------------------------------
@@ -409,10 +430,32 @@ def preview_task_draft(
                 intent = fallback
                 model = "offline parser"
                 if intent["action"] in CREATE_ACTIONS:
-                    task, collect = prefill_from_message(
-                        intent["action"], _task_of(intent), {}, message, today
+                    task, collect = (
+                        prefill_from_message(
+                            intent["action"],
+                            _task_of(intent),
+                            {},
+                            message,
+                            today,
+                        )
                     )
-                    intent = _with_task(intent, task, collect)
+
+                    resolved_action = (
+                        selected_create_action(
+                            intent["action"],
+                            collect,
+                        )
+                    )
+
+                    intent = _with_task(
+                        {
+                            **intent,
+                            "action":
+                                resolved_action,
+                        },
+                        task,
+                        collect,
+                    )
             else:
                 raise
         else:
@@ -434,9 +477,27 @@ def preview_task_draft(
                     task, collect = prefill_from_message(
                         action, task, collect, message, today
                     )
-                intent = _with_task(intent, task, collect)
+                resolved_action = (
+                    selected_create_action(
+                        action,
+                        collect,
+                    )
+                )
 
-    evaluated = _evaluate_intent(intent, today.isoformat())
+                intent = _with_task(
+                    {
+                        **intent,
+                        "action":
+                            resolved_action,
+                    },
+                    task,
+                    collect,
+                )
+
+    evaluated = _evaluate_intent(
+        intent,
+        today.isoformat(),
+    )
 
     # ---- 3. Never ask the exact same question twice in a row -----------
     question = evaluated.get("question")

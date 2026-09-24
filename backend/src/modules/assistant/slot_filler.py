@@ -634,7 +634,10 @@ def fill_gaps(task, extracted, action=None):
     result = deepcopy(task) if isinstance(task, dict) else {}
 
     for key, value in (extracted or {}).items():
-        if key == "duration" and action != "create_recurring_task":
+        if key == "duration" and action not in {
+            "create_recurring_task",
+            "create_repeat_until_done_task",
+        }:
             continue
 
         if key == "duration":

@@ -1,12 +1,5 @@
 from datetime import datetime
 
-
-# =========================================================
-# ALLOWED VALUES
-# =========================================================
-
-# These are the four Eisenhower Matrix priority values
-# supported by the application.
 ALLOWED_PRIORITIES = {
     "important_urgent",
     "important_not_urgent",
@@ -14,20 +7,6 @@ ALLOWED_PRIORITIES = {
     "not_important_not_urgent"
 }
 
-
-# Repeat Until Done supports four repeat modes.
-#
-# everyday:
-#     Reminders can occur every day until completion.
-#
-# weekdays:
-#     Reminders can occur Monday-Friday until completion.
-#
-# weekends:
-#     Reminders can occur Saturday-Sunday until completion.
-#
-# custom_dates:
-#     Reminders can occur only on specific calendar dates.
 ALLOWED_REPEAT_TYPES = {
     "everyday",
     "weekdays",
@@ -35,502 +14,196 @@ ALLOWED_REPEAT_TYPES = {
     "custom_dates"
 }
 
-
-# These are the only fields that can be changed
-# through the normal PATCH update endpoint.
-#
-# Backend-controlled fields such as:
-# task_type, status, completed_at, created_at,
-# updated_at and reminders_cancelled cannot be
-# directly changed by the client.
 UPDATABLE_FIELDS = {
     "title",
     "description",
     "priority",
+    "duration",
     "repeat",
     "reminders"
 }
 
-
-# =========================================================
-# CUSTOM DATE VALIDATION
-# =========================================================
-
-def is_valid_date(date_string):
-    """
-    Check whether a value is a valid YYYY-MM-DD date.
-
-    Examples:
-
-        2026-09-20 -> valid
-        2026-02-30 -> invalid
-        20-09-2026 -> invalid
-        hello      -> invalid
-
-    Returns:
-        True when valid.
-        False when invalid.
-    """
-
+def parse_date(date_string):
     if not isinstance(date_string, str):
-        return False
-
+        return None
     try:
-        datetime.strptime(
-            date_string,
-            "%Y-%m-%d"
-        )
-
-        return True
-
+        return datetime.strptime(date_string, "%Y-%m-%d")
     except ValueError:
-        return False
+        return None
 
+def validate_duration(duration, errors):
+    if not isinstance(duration, dict):
+        errors["duration"] = "Duration must be an object."
+        return
 
-# =========================================================
-# REPEAT VALIDATION
-# =========================================================
+    start_date = parse_date(duration.get("start_date"))
+    end_date = parse_date(duration.get("end_date"))
 
-def validate_repeat(repeat, errors):
-    """
-    Validate the repeat configuration.
-
-    Example for predefined repeat:
-
-    {
-        "type": "weekdays",
-        "custom_dates": []
-    }
-
-
-    Example for custom dates:
-
-    {
-        "type": "custom_dates",
-        "custom_dates": [
-            "2026-09-20",
-            "2026-09-25"
-        ]
-    }
-    """
-
-    # Repeat must be a JSON object / Python dictionary.
-    if not isinstance(repeat, dict):
-        errors["repeat"] = (
-            "Repeat must be an object."
+    if start_date is None:
+        errors["duration.start_date"] = (
+            "start_date must be a valid date using YYYY-MM-DD format."
         )
+
+    if end_date is None:
+        errors["duration.end_date"] = (
+            "end_date must be a valid date using YYYY-MM-DD format."
+        )
+
+    if start_date is not None and end_date is not None and end_date < start_date:
+        errors["duration"] = "end_date cannot be before start_date."
+
+def validate_repeat(repeat, duration, errors):
+    if not isinstance(repeat, dict):
+        errors["repeat"] = "Repeat must be an object."
         return
 
     repeat_type = repeat.get("type")
-
-    # Make sure the repeat type is supported.
     if repeat_type not in ALLOWED_REPEAT_TYPES:
         errors["repeat.type"] = (
-            "Repeat type must be everyday, "
-            "weekdays, weekends, or custom_dates."
+            "Repeat type must be everyday, weekdays, weekends, or custom_dates."
         )
         return
 
-    # custom_dates defaults to an empty list.
-    custom_dates = repeat.get(
-        "custom_dates",
-        []
-    )
+    custom_dates = repeat.get("custom_dates", [])
 
-    # custom_dates must always be represented as a list.
     if not isinstance(custom_dates, list):
-        errors["repeat.custom_dates"] = (
-            "custom_dates must be a list."
-        )
+        errors["repeat.custom_dates"] = "custom_dates must be a list."
         return
-
-    # -----------------------------------------------------
-    # CUSTOM DATES
-    # -----------------------------------------------------
 
     if repeat_type == "custom_dates":
-
-        # At least one calendar date must be selected.
-        if len(custom_dates) == 0:
-            errors["repeat.custom_dates"] = (
-                "Select at least one date "
-                "for custom_dates repeat."
-            )
+        if not custom_dates:
+            errors["repeat.custom_dates"] = "Select at least one custom date."
             return
 
-        # Find dates that either:
-        # - are not strings
-        # - do not use YYYY-MM-DD
-        # - are impossible calendar dates
-        invalid_dates = [
-            date
-            for date in custom_dates
-            if not is_valid_date(date)
-        ]
+        parsed_dates = []
+        for date_string in custom_dates:
+            parsed_date = parse_date(date_string)
+            if parsed_date is None:
+                errors["repeat.custom_dates"] = (
+                    "Every custom date must be a valid YYYY-MM-DD date."
+                )
+                return
+            parsed_dates.append(parsed_date)
 
-        if invalid_dates:
-            errors["repeat.custom_dates"] = (
-                "All custom dates must be valid "
-                "calendar dates using YYYY-MM-DD format."
-            )
+        if len(custom_dates) != len(set(custom_dates)):
+            errors["repeat.custom_dates"] = "Duplicate custom dates are not allowed."
             return
 
-        # Prevent duplicate dates such as:
-        #
-        # [
-        #     "2026-09-20",
-        #     "2026-09-20"
-        # ]
-        if len(custom_dates) != len(
-            set(custom_dates)
-        ):
-            errors["repeat.custom_dates"] = (
-                "Duplicate custom dates are not allowed."
-            )
-
-    # -----------------------------------------------------
-    # EVERYDAY / WEEKDAYS / WEEKENDS
-    # -----------------------------------------------------
-
+        if isinstance(duration, dict):
+            start_date = parse_date(duration.get("start_date"))
+            end_date = parse_date(duration.get("end_date"))
+            if start_date is not None and end_date is not None:
+                if any(d < start_date or d > end_date for d in parsed_dates):
+                    errors["repeat.custom_dates"] = (
+                        "Custom dates must fall inside the task duration."
+                    )
     else:
-
-        # Predefined repeat patterns do not use
-        # specific custom dates.
         if custom_dates:
             errors["repeat.custom_dates"] = (
-                "custom_dates must be empty unless "
-                "repeat type is custom_dates."
+                "custom_dates must be empty unless repeat type is custom_dates."
             )
-
-
-# =========================================================
-# REMINDER VALIDATION
-# =========================================================
 
 def validate_reminders(reminders, errors):
-    """
-    Validate reminder windows.
-
-    Example:
-
-    {
-        "start_time": "13:00",
-        "end_time": "14:00",
-        "count": 3
-    }
-
-    Rules:
-        - reminders must be a list
-        - start_time must use HH:MM
-        - end_time must use HH:MM
-        - start_time must be before end_time
-        - count must be an integer >= 1
-    """
-
-    # reminders must always be represented as a list.
     if not isinstance(reminders, list):
-        errors["reminders"] = (
-            "Reminders must be a list."
-        )
+        errors["reminders"] = "Reminders must be a list."
         return
 
-    # Validate every reminder window separately.
-    for index, reminder in enumerate(
-        reminders
-    ):
-
-        # Every reminder item must be an object.
+    for index, reminder in enumerate(reminders):
         if not isinstance(reminder, dict):
-            errors[
-                f"reminders[{index}]"
-            ] = (
-                "Reminder must be an object."
-            )
-
+            errors[f"reminders[{index}]"] = "Reminder must be an object."
             continue
 
-        start_time = reminder.get(
-            "start_time"
-        )
-
-        end_time = reminder.get(
-            "end_time"
-        )
-
-        count = reminder.get(
-            "count"
-        )
-
-        # -------------------------------------------------
-        # TIME VALIDATION
-        # -------------------------------------------------
+        start_time = reminder.get("start_time")
+        end_time = reminder.get("end_time")
+        count = reminder.get("count")
 
         try:
-            start = datetime.strptime(
-                start_time,
-                "%H:%M"
-            )
-
-            end = datetime.strptime(
-                end_time,
-                "%H:%M"
-            )
-
-            # Reminder windows currently cannot cross
-            # midnight, so start must be before end.
+            start = datetime.strptime(start_time, "%H:%M")
+            end = datetime.strptime(end_time, "%H:%M")
             if start >= end:
-                errors[
-                    f"reminders[{index}].time"
-                ] = (
-                    "start_time must be "
-                    "before end_time."
+                errors[f"reminders[{index}].time"] = (
+                    "start_time must be before end_time."
                 )
-
         except (ValueError, TypeError):
-
-            errors[
-                f"reminders[{index}].time"
-            ] = (
-                "start_time and end_time "
-                "must use HH:MM format."
+            errors[f"reminders[{index}].time"] = (
+                "start_time and end_time must use HH:MM format."
             )
 
-        # -------------------------------------------------
-        # COUNT VALIDATION
-        # -------------------------------------------------
-
-        # Python considers bool a subclass of int,
-        # so explicitly reject True and False.
-        if (
-            not isinstance(count, int)
-            or isinstance(count, bool)
-            or count < 1
-        ):
-            errors[
-                f"reminders[{index}].count"
-            ] = (
-                "Reminder count must be an integer "
-                "greater than 0."
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            errors[f"reminders[{index}].count"] = (
+                "Reminder count must be an integer greater than 0."
             )
 
-
-# =========================================================
-# CREATE VALIDATION
-# =========================================================
-
-def validate_create_repeat_until_done_task(
-    data
-):
-    """
-    Validate the request body used to create
-    a Repeat Until Done task.
-
-    Required:
-        title
-        priority
-        repeat
-
-    Optional:
-        description
-        reminders
-    """
-
+def validate_create_repeat_until_done_task(data):
     errors = {}
 
-    # Request body must be a JSON object.
     if not isinstance(data, dict):
-        errors["request"] = (
-            "Request body must be an object."
-        )
-
+        errors["request"] = "Request body must be an object."
         return errors
-
-    # -----------------------------------------------------
-    # TITLE
-    # -----------------------------------------------------
 
     title = data.get("title")
+    if not isinstance(title, str) or not title.strip():
+        errors["title"] = "Title is required."
 
-    if (
-        not isinstance(title, str)
-        or not title.strip()
-    ):
-        errors["title"] = (
-            "Title is required."
-        )
+    if "description" in data and not isinstance(data["description"], str):
+        errors["description"] = "Description must be a string."
 
-    # -----------------------------------------------------
-    # DESCRIPTION
-    # -----------------------------------------------------
+    if data.get("priority") not in ALLOWED_PRIORITIES:
+        errors["priority"] = "Invalid priority."
 
-    if "description" in data:
-
-        if not isinstance(
-            data["description"],
-            str
-        ):
-            errors["description"] = (
-                "Description must be a string."
-            )
-
-    # -----------------------------------------------------
-    # PRIORITY
-    # -----------------------------------------------------
-
-    priority = data.get("priority")
-
-    if priority not in ALLOWED_PRIORITIES:
-        errors["priority"] = (
-            "Invalid priority."
-        )
-
-    # -----------------------------------------------------
-    # REPEAT
-    # -----------------------------------------------------
+    duration = data.get("duration")
+    if duration is None:
+        errors["duration"] = "Duration is required."
+    else:
+        validate_duration(duration, errors)
 
     repeat = data.get("repeat")
-
     if repeat is None:
-        errors["repeat"] = (
-            "Repeat configuration is required."
-        )
-
+        errors["repeat"] = "Repeat configuration is required."
     else:
-        validate_repeat(
-            repeat,
-            errors
-        )
+        validate_repeat(repeat, duration, errors)
 
-    # -----------------------------------------------------
-    # REMINDERS
-    # -----------------------------------------------------
-
-    # No reminders is currently allowed.
-    # If omitted, it becomes an empty list.
-    reminders = data.get(
-        "reminders",
-        []
-    )
-
-    validate_reminders(
-        reminders,
-        errors
-    )
-
+    validate_reminders(data.get("reminders", []), errors)
     return errors
 
-
-# =========================================================
-# UPDATE VALIDATION
-# =========================================================
-
-def validate_update_repeat_until_done_task(
-    data
-):
-    """
-    Validate PATCH data for a Repeat Until Done task.
-
-    Only these fields can be changed:
-
-        title
-        description
-        priority
-        repeat
-        reminders
-
-    Lifecycle fields are controlled by the backend.
-    """
-
+def validate_update_repeat_until_done_task(data, current_task=None):
     errors = {}
 
-    # PATCH must contain at least one field.
     if not isinstance(data, dict) or not data:
-        errors["request"] = (
-            "At least one field is required."
-        )
-
+        errors["request"] = "At least one field is required."
         return errors
 
-    # -----------------------------------------------------
-    # PROTECTED FIELD CHECK
-    # -----------------------------------------------------
-
-    invalid_fields = (
-        set(data.keys())
-        - UPDATABLE_FIELDS
-    )
-
+    invalid_fields = set(data.keys()) - UPDATABLE_FIELDS
     if invalid_fields:
         errors["fields"] = (
-            "Fields cannot be updated: "
-            + ", ".join(
-                sorted(invalid_fields)
-            )
+            "Fields cannot be updated: " + ", ".join(sorted(invalid_fields))
         )
-
-    # -----------------------------------------------------
-    # TITLE
-    # -----------------------------------------------------
 
     if "title" in data:
+        if not isinstance(data["title"], str) or not data["title"].strip():
+            errors["title"] = "Title cannot be empty."
 
-        if (
-            not isinstance(
-                data["title"],
-                str
-            )
-            or not data["title"].strip()
-        ):
-            errors["title"] = (
-                "Title cannot be empty."
-            )
+    if "description" in data and not isinstance(data["description"], str):
+        errors["description"] = "Description must be a string."
 
-    # -----------------------------------------------------
-    # DESCRIPTION
-    # -----------------------------------------------------
+    if "priority" in data and data["priority"] not in ALLOWED_PRIORITIES:
+        errors["priority"] = "Invalid priority."
 
-    if "description" in data:
+    existing_duration = current_task.get("duration") if current_task else None
+    existing_repeat = current_task.get("repeat") if current_task else None
 
-        if not isinstance(
-            data["description"],
-            str
-        ):
-            errors["description"] = (
-                "Description must be a string."
-            )
+    effective_duration = data.get("duration", existing_duration)
+    effective_repeat = data.get("repeat", existing_repeat)
 
-    # -----------------------------------------------------
-    # PRIORITY
-    # -----------------------------------------------------
-
-    if "priority" in data:
-
-        if (
-            data["priority"]
-            not in ALLOWED_PRIORITIES
-        ):
-            errors["priority"] = (
-                "Invalid priority."
-            )
-
-    # -----------------------------------------------------
-    # REPEAT
-    # -----------------------------------------------------
+    if "duration" in data:
+        validate_duration(data["duration"], errors)
 
     if "repeat" in data:
-        validate_repeat(
-            data["repeat"],
-            errors
-        )
-
-    # -----------------------------------------------------
-    # REMINDERS
-    # -----------------------------------------------------
+        validate_repeat(data["repeat"], effective_duration, errors)
+    elif "duration" in data and effective_repeat is not None:
+        validate_repeat(effective_repeat, effective_duration, errors)
 
     if "reminders" in data:
-        validate_reminders(
-            data["reminders"],
-            errors
-        )
+        validate_reminders(data["reminders"], errors)
 
     return errors

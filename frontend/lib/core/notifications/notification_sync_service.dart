@@ -182,18 +182,100 @@ class NotificationSyncService {
 
       final title = task['title']?.toString() ?? 'Task reminder';
 
-      final repeat = _asMap(task['repeat']);
+      final repeat =
+          _asMap(
+        task['repeat'],
+      );
 
-      final times = _generatedTimes(task['reminders']);
+      final duration =
+          _asMap(
+        task['duration'],
+      );
+
+      final rawStart =
+          DateTime.tryParse(
+        duration['start_date']
+                ?.toString() ??
+            '',
+      );
+
+      final rawEnd =
+          DateTime.tryParse(
+        duration['end_date']
+                ?.toString() ??
+            '',
+      );
+
+      var firstScheduledDate =
+          startDate;
+
+      if (rawStart != null) {
+        final date = DateTime(
+          rawStart.year,
+          rawStart.month,
+          rawStart.day,
+        );
+
+        if (date.isAfter(
+          firstScheduledDate,
+        )) {
+          firstScheduledDate =
+              date;
+        }
+      }
+
+      final durationEnd =
+          rawEnd == null
+              ? null
+              : DateTime(
+                  rawEnd.year,
+                  rawEnd.month,
+                  rawEnd.day,
+                );
+
+      if (
+          durationEnd != null &&
+          firstScheduledDate
+              .isAfter(
+            durationEnd,
+          )) {
+        continue;
+      }
+
+      final times =
+          _generatedTimes(
+        task['reminders'],
+      );
 
       if (times.isEmpty) {
         continue;
       }
 
-      for (var offset = 0; offset < _repeatUntilDoneHorizonDays; offset++) {
-        final date = startDate.add(Duration(days: offset));
+      for (
+        var offset = 0;
+        offset <
+            _repeatUntilDoneHorizonDays;
+        offset++
+      ) {
+        final date =
+            firstScheduledDate.add(
+          Duration(
+            days: offset,
+          ),
+        );
 
-        if (!_repeatMatchesDate(repeat, date)) {
+        if (
+            durationEnd != null &&
+            date.isAfter(
+              durationEnd,
+            )) {
+          break;
+        }
+
+        if (!_repeatMatchesDate(
+          repeat,
+          date,
+        )) {
           continue;
         }
 

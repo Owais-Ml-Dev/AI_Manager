@@ -96,18 +96,50 @@ def _fields_in_order(action, answers):
 def test_recurring_order():
     asked, task = _fields_in_order(
         "create_recurring_task",
-        ["from today to 15 oct", "weekdays", "2", "9 am to 11 am", "6-8 pm"],
+        [
+            "from today to 15 oct",
+            "weekdays",
+            "2",
+            "9 am to 11 am",
+            "2",
+            "6-8 pm",
+            "3",
+        ],
     )
-    assert asked == ["duration", "repeat", "reminders.count", "reminders.window", "reminders.window"]
+
+    assert asked == [
+        "duration",
+        "repeat",
+        "reminders.count",
+        "reminders.window",
+        "reminders.window_reminder_count",
+        "reminders.window",
+        "reminders.window_reminder_count",
+    ]
     assert len(task["reminders"]) == 2
 
 
 def test_repeat_until_done_order():
     asked, _ = _fields_in_order(
         "create_repeat_until_done_task",
-        ["everyday", "1", "4:22", "pm"],
+        [
+            "from today to 15 oct",
+            "everyday",
+            "1",
+            "4:22",
+            "pm",
+            "3",
+        ],
     )
-    assert asked == ["repeat", "reminders.count", "reminders.window", "reminders.meridiem"]
+
+    assert asked == [
+        "duration",
+        "repeat",
+        "reminders.count",
+        "reminders.window",
+        "reminders.meridiem",
+        "reminders.window_reminder_count",
+    ]
 
 
 def test_local_title_when_gemini_is_down():
@@ -155,9 +187,23 @@ def test_screenshot_conversation(app, monkeypatch):
     monkeypatch.setattr(draft_service, "parse_task_message", _fake_parser(calls))
 
     with app.app_context():
-        result = _run(["Add buy task", "Everyday", "1", "4:22"])
+        result = _run([
+            "Add buy task",
+            "today for 2 weeks",
+            "Everyday",
+            "1",
+            "4:22",
+        ])
+
         assert "AM or PM" in result["question"]
-        result = _run_more(result, ["PM"])
+
+        result = _run_more(
+            result,
+            [
+                "PM",
+                "3",
+            ],
+        )
 
     assert result["status"] in {"ready", "duplicate_review"}
     task = result["command"]["arguments"]["task"]
@@ -178,7 +224,14 @@ def test_gemini_down_still_creates(app, monkeypatch):
     monkeypatch.setattr(draft_service, "parse_task_message", _fake_parser(calls, fail=True))
 
     with app.app_context():
-        result = _run(["Create buy", "weekends", "1", "7 pm to 9 pm"])
+        result = _run([
+            "Create buy",
+            "today for 2 weeks",
+            "weekends",
+            "1",
+            "7 pm to 9 pm",
+            "2",
+        ])
 
     assert result["status"] in {"ready", "duplicate_review"}
     assert result["command"]["arguments"]["task"]["title"] == "Buy"

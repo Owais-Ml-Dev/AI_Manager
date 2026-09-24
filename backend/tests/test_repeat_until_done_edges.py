@@ -8,6 +8,7 @@ def base_payload():
         "title": "Task",
         "description": "",
         "priority": "important_urgent",
+        "duration": {"start_date": "2099-01-01", "end_date": "2099-12-31"},
         "repeat": {
             "type": "everyday",
             "custom_dates": []

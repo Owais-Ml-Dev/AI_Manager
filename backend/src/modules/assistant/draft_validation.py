@@ -86,9 +86,6 @@ def build_create_preview(intent):
     task = _normalize_task(arguments.get("task"))
     collect = dict(arguments.get("collect") or {})
 
-    if action != "create_recurring_task":
-        task.pop("duration", None)
-
     def needs(step, prefix=""):
         return {
             "status": "needs_input",
@@ -122,7 +119,16 @@ def build_create_preview(intent):
                 for field in fields:
                     task.pop(field, None)
                 if prefix == "reminders":
-                    collect.pop("window_count", None)
+                    collect.pop(
+                        "window_count",
+                        None
+                    )
+
+                    collect.pop(
+                        "confirmed_window_counts",
+                        None
+                    )
+
                 break
         step = next_step(action, task, collect)
         if step:

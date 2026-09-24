@@ -120,7 +120,10 @@ def validate_executable_command(command):
             raise TaskCommandError(
                 "The selected Repeat Until Done task no longer exists.", 404
             )
-        errors = validate_update_repeat_until_done_task(changes)
+        errors = validate_update_repeat_until_done_task(
+            changes,
+            current
+        )
         if errors:
             raise TaskCommandError(
                 "Repeat Until Done update failed validation.", 422, errors

@@ -1,7 +1,7 @@
-"""Gemini-only assistant service.
+"""Multi-provider assistant service.
 
-Gemini handles chat and structured task parsing.  Draft validation, duplicate
-matching, execution, and persistence remain deterministic backend concerns.
+Cloud models interpret chat/task language. Draft validation, confirmation,
+execution and persistence remain deterministic backend concerns.
 """
 
 from src.modules.assistant.drafts.service import (
@@ -10,21 +10,34 @@ from src.modules.assistant.drafts.service import (
     select_draft_target,
 )
 from src.modules.assistant.prompts.chat_prompt import CHAT_SYSTEM_PROMPT
-from src.modules.assistant.providers.provider_factory import create_provider
+from src.modules.assistant.providers.provider_router import (
+    chat_with_fallback,
+    provider_health,
+)
 
 
-def get_assistant_status(api_key=None):
-    return create_provider(api_key=api_key).health()
+def get_assistant_status(api_key=None, provider_name="gemini", credentials=None):
+    return provider_health(
+        provider_name,
+        credentials=credentials,
+        api_key=api_key,
+    )
 
 
-def send_chat(message, api_key=None):
-    provider = create_provider(api_key=api_key)
-    reply = provider.chat(message=message, system_prompt=CHAT_SYSTEM_PROMPT)
+def send_chat(message, api_key=None, credentials=None):
+    routed = chat_with_fallback(
+        message=message,
+        system_prompt=CHAT_SYSTEM_PROMPT,
+        credentials=credentials,
+        api_key=api_key,
+    )
     return {
-        "provider": "gemini",
-        "type": "api",
-        "model": getattr(provider, "model_used", provider.model),
-        "reply": reply,
+        "provider": routed["provider"],
+        "type": routed["type"],
+        "model": routed["model"],
+        "reply": routed["result"],
+        "fallback_used": routed["fallback_used"],
+        "attempted_providers": routed["attempted_providers"],
     }
 
 
@@ -33,11 +46,13 @@ def preview_task_command(
     timezone_name="UTC",
     api_key=None,
     draft_id=None,
+    credentials=None,
 ):
     return preview_task_draft(
         message=message,
         timezone_name=timezone_name,
         api_key=api_key,
+        credentials=credentials,
         draft_id=draft_id,
     )
 

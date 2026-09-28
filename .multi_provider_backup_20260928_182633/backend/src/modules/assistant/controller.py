@@ -35,35 +35,6 @@ def _request_gemini_api_key():
     return request.headers.get("X-Gemini-Api-Key", "").strip()
 
 
-
-def _request_provider_credentials():
-    """Read request-scoped provider credentials without logging them."""
-    return {
-        "gemini_api_key": _request_gemini_api_key(),
-        "groq_api_key": request.headers.get("X-Groq-Api-Key", "").strip(),
-        "cloudflare_api_token": request.headers.get(
-            "X-Cloudflare-Api-Token", ""
-        ).strip(),
-        "cloudflare_account_id": request.headers.get(
-            "X-Cloudflare-Account-Id", ""
-        ).strip(),
-        "openrouter_api_key": request.headers.get(
-            "X-OpenRouter-Api-Key", ""
-        ).strip(),
-    }
-
-
-def _has_non_gemini_credentials(credentials):
-    return any(
-        credentials.get(name)
-        for name in (
-            "groq_api_key",
-            "cloudflare_api_token",
-            "openrouter_api_key",
-        )
-    )
-
-
 def _provider_error_response(error):
     if isinstance(error, ProviderNotConfiguredError):
         return jsonify({"success": False, "message": str(error)}), 503
@@ -91,19 +62,10 @@ def _draft_error_response(error):
 
 
 def get_assistant_health_controller():
-    provider_name = request.args.get("provider", "gemini").strip().lower() or "gemini"
-    credentials = _request_provider_credentials()
-
-    if provider_name == "gemini" and not _has_non_gemini_credentials(credentials):
-        data = get_assistant_status(api_key=_request_gemini_api_key())
-    else:
-        data = get_assistant_status(
-            api_key=_request_gemini_api_key(),
-            provider_name=provider_name,
-            credentials=credentials,
-        )
-
-    return jsonify({"success": True, "data": data}), 200
+    return jsonify({
+        "success": True,
+        "data": get_assistant_status(api_key=_request_gemini_api_key()),
+    }), 200
 
 
 
@@ -178,18 +140,10 @@ def assistant_chat_controller():
         }), 400
 
     try:
-        credentials = _request_provider_credentials()
-        if _has_non_gemini_credentials(credentials):
-            result = send_chat(
-                message=message.strip(),
-                api_key=_request_gemini_api_key(),
-                credentials=credentials,
-            )
-        else:
-            result = send_chat(
-                message=message.strip(),
-                api_key=_request_gemini_api_key(),
-            )
+        result = send_chat(
+            message=message.strip(),
+            api_key=_request_gemini_api_key(),
+        )
     except (
         ProviderNotConfiguredError,
         ProviderConnectionError,
@@ -224,16 +178,12 @@ def preview_task_command_controller():
         return jsonify({"success": False, "message": "draft_id must be a string."}), 400
 
     try:
-        credentials = _request_provider_credentials()
-        kwargs = {
-            "message": message.strip(),
-            "timezone_name": timezone_name.strip() or "UTC",
-            "api_key": _request_gemini_api_key(),
-            "draft_id": draft_id.strip() if isinstance(draft_id, str) else None,
-        }
-        if _has_non_gemini_credentials(credentials):
-            kwargs["credentials"] = credentials
-        result = preview_task_command(**kwargs)
+        result = preview_task_command(
+            message=message.strip(),
+            timezone_name=timezone_name.strip() or "UTC",
+            api_key=_request_gemini_api_key(),
+            draft_id=draft_id.strip() if isinstance(draft_id, str) else None,
+        )
     except AssistantDraftError as error:
         return _draft_error_response(error)
     except TaskParserError as error:

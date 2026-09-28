@@ -126,7 +126,7 @@ class AssistantRepository {
     String message, {
     CancelToken? cancelToken,
   }) async {
-    final headers = await _providerHeaders();
+    final headers = await _geminiHeaders();
     final result = await _apiClient.post(
       '/api/assistant/chat',
       data: {'message': message},
@@ -145,7 +145,7 @@ class AssistantRepository {
     String? draftId,
     CancelToken? cancelToken,
   }) async {
-    final headers = await _providerHeaders();
+    final headers = await _geminiHeaders();
     final payload = <String, dynamic>{
       'message': message,
       'timezone': _deviceUtcOffset(),
@@ -234,32 +234,6 @@ class AssistantRepository {
       );
     }
     return {'X-Gemini-Api-Key': apiKey};
-  }
-
-  Future<Map<String, dynamic>> _providerHeaders() async {
-    final headers = <String, dynamic>{};
-
-    final gemini = await _keyStore.readProviderApiKey('gemini');
-    final groq = await _keyStore.readProviderApiKey('groq');
-    final cloudflare = await _keyStore.readProviderApiKey('cloudflare');
-    final cloudflareAccountId = await _keyStore.readCloudflareAccountId();
-    final openrouter = await _keyStore.readProviderApiKey('openrouter');
-
-    if (gemini != null) headers['X-Gemini-Api-Key'] = gemini;
-    if (groq != null) headers['X-Groq-Api-Key'] = groq;
-    if (cloudflare != null && cloudflareAccountId != null) {
-      headers['X-Cloudflare-Api-Token'] = cloudflare;
-      headers['X-Cloudflare-Account-Id'] = cloudflareAccountId;
-    }
-    if (openrouter != null) headers['X-OpenRouter-Api-Key'] = openrouter;
-
-    if (headers.isEmpty) {
-      throw const ApiException(
-        message: 'Add at least one AI provider API key in Settings first.',
-      );
-    }
-
-    return headers;
   }
 
   String _deviceUtcOffset() {

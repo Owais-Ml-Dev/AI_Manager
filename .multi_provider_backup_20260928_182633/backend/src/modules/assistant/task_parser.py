@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone as datetime_timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.modules.assistant.prompts.task_command_prompt import TASK_COMMAND_SYSTEM_PROMPT
-from src.modules.assistant.providers.provider_router import structured_json_with_fallback
+from src.modules.assistant.providers.provider_factory import create_provider
 
 
 PARSER_ACTIONS = [
@@ -263,7 +263,6 @@ def parse_task_message(
     message,
     timezone_name="UTC",
     api_key=None,
-    credentials=None,
     current_draft=None,
     pending_question=None,
 ):
@@ -295,33 +294,28 @@ def parse_task_message(
         + f"USER MESSAGE: {message.strip()}"
     )
 
+    provider = create_provider(api_key=api_key)
     started = time.monotonic()
-    routed = structured_json_with_fallback(
+    parsed = provider.structured_json(
         message=user_prompt,
         system_prompt=TASK_COMMAND_SYSTEM_PROMPT,
         response_schema=TASK_INTENT_RESPONSE_SCHEMA,
-        credentials=credentials,
-        api_key=api_key,
     )
-    parsed = routed["result"]
 
+    # Visible in the Flask terminal: what Gemini actually returned and how
+    # long it took. If the assistant ever misunderstands something, this
+    # line shows whether Gemini or the backend is responsible.
     print(
-        "[assistant] %s parse %.1fs -> %s"
-        % (
-            routed["provider"],
-            time.monotonic() - started,
-            json.dumps(parsed, ensure_ascii=False)[:500],
-        ),
+        "[assistant] Gemini parse %.1fs -> %s"
+        % (time.monotonic() - started, json.dumps(parsed, ensure_ascii=False)[:500]),
         flush=True,
     )
 
     return {
-        "provider": routed["provider"],
-        "type": routed["type"],
-        "model": routed["model"],
+        "provider": "gemini",
+        "type": "api",
+        "model": getattr(provider, "model_used", provider.model),
         "timezone": timezone_name,
         "local_now": now,
         "intent": _sanitize_intent(parsed),
-        "fallback_used": routed["fallback_used"],
-        "attempted_providers": routed["attempted_providers"],
     }

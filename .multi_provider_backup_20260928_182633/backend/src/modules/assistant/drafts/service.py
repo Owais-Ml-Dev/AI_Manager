@@ -29,7 +29,6 @@ from src.modules.assistant.drafts.repository import (
 )
 from src.modules.assistant.providers.base_provider import (
     ProviderConnectionError,
-    ProviderNotConfiguredError,
     ProviderResponseError,
 )
 from src.modules.assistant.create_flow import (
@@ -383,7 +382,6 @@ def preview_task_draft(
     message,
     timezone_name="UTC",
     api_key=None,
-    credentials=None,
     draft_id=None,
 ):
     """Parse one user message and persist/update the server-owned draft.
@@ -631,23 +629,20 @@ def preview_task_draft(
 
     if intent is None:
         try:
-            parse_kwargs = {
-                "message": message,
-                "timezone_name": timezone_name,
-                "api_key": api_key,
-                "current_draft": current_intent,
-                "pending_question": (existing or {}).get("question") if answering else None,
-            }
-            if credentials is not None:
-                parse_kwargs["credentials"] = credentials
-            parsed = parse_task_message(**parse_kwargs)
-        except (ProviderNotConfiguredError, ProviderConnectionError, ProviderResponseError) as error:
+            parsed = parse_task_message(
+                message=message,
+                timezone_name=timezone_name,
+                api_key=api_key,
+                current_draft=current_intent,
+                pending_question=(existing or {}).get("question") if answering else None,
+            )
+        except (ProviderConnectionError, ProviderResponseError) as error:
             if local_answer is not None:
                 intent = local_answer
             elif not answering and (fallback := local_intent(message, today)):
                 # Gemini is overloaded/unreachable, but this is a plain
                 # "create X" request we can read ourselves.
-                print(f"[assistant] cloud providers unavailable ({error}); using local parse.", flush=True)
+                print(f"[assistant] Gemini unavailable ({error}); using local parse.", flush=True)
                 intent = fallback
                 model = "offline parser"
                 if intent["action"] in CREATE_ACTIONS:

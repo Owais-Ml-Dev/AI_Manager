@@ -10,7 +10,6 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../../core/theme/app_colors.dart';
 import '../application/assistant_providers.dart';
-import 'widgets/voice_orb.dart';
 import '../data/assistant_repository.dart';
 import '../domain/assistant_intent.dart';
 import '../../home/application/home_providers.dart';
@@ -42,6 +41,8 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
   WebSocketChannel? _channel;
 
   StreamSubscription<dynamic>? _socketSubscription;
+
+  String _model = 'gemini-3.8-live';
 
   // =========================================================
   // MICROPHONE
@@ -81,11 +82,6 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
 
   String _userTranscript = '';
   String _assistantTranscript = '';
-
-  // Real-time level used only for the visual orb.
-  double _voiceVisualLevel = 0.06;
-
-  int _lastVoiceVisualUpdate = 0;
 
   // =========================================================
   // TASK WORKFLOW
@@ -134,6 +130,8 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
       if (!mounted) {
         return;
       }
+
+      _model = token.model;
 
       setState(() {
         _status = 'Opening Live session...';
@@ -1259,66 +1257,10 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
   }
 
   // =========================================================
-  // AUDIO LEVEL -> ORB ANIMATION
-  // =========================================================
-
-  void _updateVoiceVisualLevel(Uint8List bytes) {
-    if (bytes.length < 2 || !mounted) {
-      return;
-    }
-
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    // Around 20 visual updates per second is enough.
-    if (now - _lastVoiceVisualUpdate < 45) {
-      return;
-    }
-
-    _lastVoiceVisualUpdate = now;
-
-    var sum = 0.0;
-
-    var count = 0;
-
-    // PCM16 little endian.
-    for (var i = 0; i + 1 < bytes.length; i += 2) {
-      var sample = bytes[i] | (bytes[i + 1] << 8);
-
-      if (sample >= 32768) {
-        sample -= 65536;
-      }
-
-      sum += sample.abs();
-
-      count++;
-    }
-
-    if (count == 0) {
-      return;
-    }
-
-    final average = sum / count;
-
-    final normalized = (average / 9000.0).clamp(0.0, 1.0).toDouble();
-
-    final target = 0.05 + normalized * 0.95;
-
-    final smoothed = _voiceVisualLevel * 0.58 + target * 0.42;
-
-    setState(() {
-      _voiceVisualLevel = smoothed;
-    });
-  }
-
-  // =========================================================
   // SEND MICROPHONE TO GEMINI
   // =========================================================
 
   void _sendMicrophoneChunk(Uint8List bytes) {
-    if (!_muted && bytes.isNotEmpty) {
-      _updateVoiceVisualLevel(bytes);
-    }
-
     if (_closing || _muted || bytes.isEmpty) {
       return;
     }
@@ -1369,10 +1311,6 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
   }
 
   void _enqueueAudio(Uint8List bytes) {
-    if (bytes.isNotEmpty) {
-      _updateVoiceVisualLevel(bytes);
-    }
-
     final generation = _playbackGeneration;
 
     _playbackChain = _playbackChain
@@ -1626,140 +1564,162 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
             // =================================================
             Expanded(
               child: Center(
-                child: SingleChildScrollView(
-                  physics: const NeverScrollableScrollPhysics(),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 26),
 
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: AnimatedBuilder(
+                    animation: _animation,
 
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
+                    builder: (context, child) {
+                      final pulse = (listening || speaking)
+                          ? (1.0 + _animation.value * 0.055)
+                          : 1.0;
 
-                    children: [
-                      // ---------------------------------------
-                      // LIVE AUDIO-REACTIVE ORB
-                      // ---------------------------------------
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
 
-                      VoiceOrb(
-                        level: _voiceVisualLevel,
+                        children: [
+                          Transform.scale(
+                            scale: pulse,
 
-                        listening: listening,
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 250),
 
-                        speaking: speaking,
+                              width: 155,
 
-                        muted: _muted,
+                              height: 155,
 
-                        failed: failed,
-                      ),
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
 
-                      const SizedBox(height: 28),
+                                color: failed
+                                    ? Colors.red.withValues(alpha: 0.12)
+                                    : speaking
+                                    ? Theme.of(context).colorScheme.primary
+                                          .withValues(alpha: 0.30)
+                                    : colors.surfaceElevated,
 
-                      // ---------------------------------------
-                      // LIVE TRANSCRIPT
-                      // ---------------------------------------
-                      AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 220),
+                                border: Border.all(
+                                  color: failed
+                                      ? Colors.red
+                                      : speaking
+                                      ? Theme.of(context).colorScheme.primary
+                                      : colors.textMuted,
+                                ),
+                              ),
 
-                        child: Text(
-                          failed
-                              ? (_error ?? 'Voice connection failed.')
-                              : speaking && _assistantTranscript.isNotEmpty
-                              ? _assistantTranscript
-                              : _userTranscript.isNotEmpty
-                              ? _userTranscript
-                              : listening
-                              ? 'I\'m listening...'
-                              : _state == VoiceSessionState.connecting
-                              ? 'Connecting to Assistant...'
-                              : 'Say something...',
+                              child: Icon(
+                                failed
+                                    ? Icons.error_outline_rounded
+                                    : speaking
+                                    ? Icons.graphic_eq_rounded
+                                    : _muted
+                                    ? Icons.mic_off_rounded
+                                    : Icons.graphic_eq_rounded,
 
-                          key: ValueKey<String>(
-                            failed
-                                ? 'error-${_error ?? ''}'
-                                : speaking
-                                ? 'assistant-$_assistantTranscript'
-                                : 'user-$_userTranscript',
+                                size: 64,
+
+                                color: failed ? Colors.red : colors.textPrimary,
+                              ),
+                            ),
                           ),
 
-                          textAlign: TextAlign.center,
+                          const SizedBox(height: 30),
 
-                          maxLines: 3,
+                          Text(
+                            _status,
+                            textAlign: TextAlign.center,
 
-                          overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: colors.textPrimary,
 
-                          style: TextStyle(
-                            color: failed
-                                ? Colors.redAccent
-                                : speaking
-                                ? Theme.of(context).colorScheme.primary
-                                : const Color(0xFFBDBDBD),
+                              fontSize: 22,
 
-                            fontSize: 13,
-
-                            height: 1.45,
-
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                      ),
-
-                      const SizedBox(height: 12),
-
-                      // ---------------------------------------
-                      // LISTENING / SPEAKING STATUS
-                      // ---------------------------------------
-                      AnimatedSwitcher(
-                        duration: const Duration(milliseconds: 180),
-
-                        child: Text(
-                          _status,
-
-                          key: ValueKey<String>(_status),
-
-                          textAlign: TextAlign.center,
-
-                          style: TextStyle(
-                            color: colors.textPrimary,
-
-                            fontSize: 22,
-
-                            fontWeight: FontWeight.w500,
-
-                            letterSpacing: -0.25,
-                          ),
-                        ),
-                      ),
-
-                      const SizedBox(height: 14),
-
-                      // ---------------------------------------
-                      // SMALL MICROPHONE STATE
-                      // ---------------------------------------
-                      if (!failed)
-                        AnimatedContainer(
-                          duration: const Duration(milliseconds: 180),
-
-                          width: 34,
-
-                          height: 34,
-
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-
-                            color: Theme.of(context).colorScheme.primary
-                                .withValues(alpha: _muted ? 0.08 : 0.16),
+                              fontWeight: FontWeight.w600,
+                            ),
                           ),
 
-                          child: Icon(
-                            _muted ? Icons.mic_off_rounded : Icons.mic_rounded,
+                          const SizedBox(height: 12),
 
-                            size: 18,
+                          if (failed)
+                            Text(
+                              _error ?? 'Unknown Voice error.',
 
-                            color: _muted
-                                ? colors.textMuted
-                                : const Color(0xFFF2F2F2),
-                          ),
-                        ),
-                    ],
+                              textAlign: TextAlign.center,
+
+                              style: TextStyle(
+                                color: colors.textSecondary,
+
+                                fontSize: 13,
+
+                                height: 1.45,
+                              ),
+                            )
+                          else ...[
+                            if (_userTranscript.isNotEmpty)
+                              Text(
+                                'You: '
+                                '$_userTranscript',
+
+                                textAlign: TextAlign.center,
+
+                                maxLines: 3,
+
+                                overflow: TextOverflow.ellipsis,
+
+                                style: TextStyle(
+                                  color: colors.textSecondary,
+
+                                  fontSize: 13,
+
+                                  height: 1.4,
+                                ),
+                              ),
+
+                            if (_assistantTranscript.isNotEmpty) ...[
+                              const SizedBox(height: 8),
+
+                              Text(
+                                'Assistant: '
+                                '$_assistantTranscript',
+
+                                textAlign: TextAlign.center,
+
+                                maxLines: 4,
+
+                                overflow: TextOverflow.ellipsis,
+
+                                style: TextStyle(
+                                  color: colors.textPrimary,
+
+                                  fontSize: 14,
+
+                                  height: 1.4,
+                                ),
+                              ),
+                            ],
+
+                            if (_userTranscript.isEmpty &&
+                                _assistantTranscript.isEmpty)
+                              Text(
+                                _state == VoiceSessionState.connecting
+                                    ? 'Creating a secure '
+                                          'Gemini Live session...'
+                                    : 'Connected to '
+                                          '$_model',
+
+                                textAlign: TextAlign.center,
+
+                                style: TextStyle(
+                                  color: colors.textSecondary,
+
+                                  fontSize: 13,
+                                ),
+                              ),
+                          ],
+                        ],
+                      );
+                    },
                   ),
                 ),
               ),

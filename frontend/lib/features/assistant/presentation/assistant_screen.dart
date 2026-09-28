@@ -1035,8 +1035,10 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
               style: IconButton.styleFrom(
                 minimumSize: const Size(42, 42),
                 maximumSize: const Size(42, 42),
-                backgroundColor: Theme.of(context).colorScheme.primary,
-                foregroundColor: Colors.white,
+                backgroundColor:
+                    const Color(0xFF2A2A2A),
+                foregroundColor:
+                    const Color(0xFFD0D0D0),
               ),
 
               icon: const Icon(Icons.graphic_eq_rounded, size: 22),

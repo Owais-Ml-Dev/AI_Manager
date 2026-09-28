@@ -8,9 +8,12 @@ import '../../../core/theme/theme_mode_provider.dart';
 import '../application/home_providers.dart';
 import '../domain/home_task_item.dart';
 import '../../tasks/application/task_providers.dart';
+import '../../history/application/history_providers.dart';
+import '../../dashboard/application/dashboard_providers.dart';
 import '../../tasks/presentation/new_task_screen.dart';
 import '../../tasks/presentation/edit_task_screen.dart';
 import '../../tasks/presentation/recurring_task_detail_screen.dart';
+import '../../tasks/presentation/repeat_until_done_task_detail_screen.dart';
 import '../../profile/presentation/profile_screen.dart';
 import '../../settings/presentation/settings_screen.dart';
 import '../../notifications/presentation/notifications_screen.dart';
@@ -170,6 +173,83 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
   }
 
+  Future<void> _deleteTask(HomeTaskItem task) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Delete task?'),
+          content: Text(
+            'This will permanently delete '
+            '"${task.title}". '
+            'This action cannot be undone.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop(false);
+              },
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                Navigator.of(dialogContext).pop(true);
+              },
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    try {
+      final repository = ref.read(taskRepositoryProvider);
+
+      if (task.kind == HomeTaskKind.recurring) {
+        await repository.deleteRecurringTask(task.taskId);
+      } else {
+        await repository.deleteRepeatUntilDoneTask(task.taskId);
+      }
+
+      // Refresh every screen affected by deletion.
+      ref.invalidate(homeDataProvider);
+
+      ref.invalidate(historyDataProvider);
+
+      ref.invalidate(dashboardDataProvider);
+
+      // Make Home refresh immediately.
+      await ref.read(homeDataProvider.future);
+
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Task deleted successfully.')),
+      );
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(error.message)));
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not delete the task.')),
+      );
+    }
+  }
+
   Widget _buildContent(
     BuildContext context, {
     required HomeData? data,
@@ -235,24 +315,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           ...tasks.map(
             (task) => _TaskRow(
               task: task,
-              onTap: task.kind == HomeTaskKind.recurring
-                  ? () async {
-                      await Navigator.push<bool>(
-                        context,
-                        MaterialPageRoute(
-                          builder: (context) {
-                            return RecurringTaskDetailScreen(
-                              taskId: task.taskId,
-                            );
-                          },
-                        ),
-                      );
-
-                      if (mounted) {
-                        ref.invalidate(homeDataProvider);
+              onTap: () async {
+                await Navigator.push<bool>(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) {
+                      if (task.kind == HomeTaskKind.recurring) {
+                        return RecurringTaskDetailScreen(taskId: task.taskId);
                       }
-                    }
-                  : null,
+
+                      return RepeatUntilDoneTaskDetailScreen(
+                        taskId: task.taskId,
+                      );
+                    },
+                  ),
+                );
+
+                if (mounted) {
+                  ref.invalidate(homeDataProvider);
+                }
+              },
               onMore: task.status == HomeTaskStatus.pending
                   ? () {
                       _showTaskActions(
@@ -285,6 +367,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                                 return _completeRecurringPermanently(task);
                               }
                             : null,
+                        onDelete: () {
+                          return _deleteTask(task);
+                        },
                       );
                     }
                   : null,
@@ -662,12 +747,11 @@ class _TaskRow extends StatelessWidget {
                 ),
               ),
 
-              if (task.kind == HomeTaskKind.recurring)
-                Icon(
-                  Icons.chevron_right,
-                  size: 18,
-                  color: AppColors.of(context).textMuted,
-                ),
+              Icon(
+                Icons.chevron_right_rounded,
+                size: 18,
+                color: AppColors.of(context).textMuted,
+              ),
 
               if (onMore != null)
                 IconButton(
@@ -825,6 +909,7 @@ void _showTaskActions(
   required Future<void> Function() onEdit,
   required Future<void> Function() onComplete,
   Future<void> Function()? onCompletePermanently,
+  required Future<void> Function() onDelete,
 }) {
   final recurring = task.kind == HomeTaskKind.recurring;
 
@@ -880,6 +965,19 @@ void _showTaskActions(
                   onCompletePermanently();
                 },
               ),
+
+            const Divider(height: 24),
+
+            _ActionRow(
+              icon: Icons.delete_outline,
+              title: 'Delete task',
+              description: 'Permanently deletes this task.',
+              onTap: () {
+                Navigator.pop(sheetContext);
+
+                onDelete();
+              },
+            ),
           ],
         ),
       );

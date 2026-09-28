@@ -102,9 +102,7 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
 
       _loadReminders(task['reminders']);
 
-      _loadDuration(
-        task['duration'],
-      );
+      _loadDuration(task['duration']);
 
       if (!mounted) {
         return;
@@ -978,14 +976,8 @@ class _EditTaskScreenState extends ConsumerState<EditTaskScreen> {
     };
 
     payload['duration'] = {
-      'start_date':
-          DateFormat('yyyy-MM-dd').format(
-        _startDate,
-      ),
-      'end_date':
-          DateFormat('yyyy-MM-dd').format(
-        _endDate,
-      ),
+      'start_date': DateFormat('yyyy-MM-dd').format(_startDate),
+      'end_date': DateFormat('yyyy-MM-dd').format(_endDate),
     };
 
     try {

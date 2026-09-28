@@ -23,3 +23,4 @@ Werkzeug==3.1.8
 cryptography>=50.0.1,<51
 
 rapidfuzz>=3.0,<4
+requests>=2.32,<3

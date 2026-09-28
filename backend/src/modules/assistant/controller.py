@@ -13,6 +13,7 @@ from src.modules.assistant.credentials.service import (
 )
 from src.modules.assistant.credentials.utils.crypto_utils import CredentialCryptoError
 from src.modules.assistant.drafts.service import AssistantDraftError
+from src.modules.assistant.live_voice import create_live_token
 from src.modules.assistant.providers.base_provider import (
     ProviderConnectionError,
     ProviderNotConfiguredError,
@@ -66,6 +67,65 @@ def get_assistant_health_controller():
         "data": get_assistant_status(api_key=_request_gemini_api_key()),
     }), 200
 
+
+
+def create_assistant_live_token_controller():
+    """
+    Create a short-lived Gemini Live API token.
+
+    The long-lived Gemini API key arrives in the existing
+    X-Gemini-Api-Key header and is never sent back.
+    """
+
+    try:
+        result = create_live_token(
+            _request_gemini_api_key()
+        )
+
+    except (
+        ProviderNotConfiguredError,
+        ProviderConnectionError,
+        ProviderResponseError,
+    ) as error:
+        return _provider_error_response(
+            error
+        )
+
+    return jsonify({
+        "success":
+            True,
+
+        "data":
+            result,
+    }), 200
+
+
+def create_live_token_controller():
+    """
+    Return a short-lived Gemini Live token.
+
+    The permanent API key arrives through the existing
+    X-Gemini-Api-Key header and is not returned.
+    """
+
+    try:
+        result = create_live_token(
+            _request_gemini_api_key()
+        )
+
+    except (
+        ProviderNotConfiguredError,
+        ProviderConnectionError,
+        ProviderResponseError,
+    ) as error:
+        return _provider_error_response(
+            error
+        )
+
+    return jsonify({
+        "success": True,
+        "data": result,
+    }), 200
 
 def assistant_chat_controller():
     data = request.get_json(silent=True)

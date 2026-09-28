@@ -4,6 +4,20 @@ import '../../../core/network/api_client.dart';
 import '../../../core/network/api_exception.dart';
 import '../../../core/security/gemini_api_key_store.dart';
 
+class AssistantLiveToken {
+  final String token;
+  final String model;
+
+  const AssistantLiveToken({required this.token, required this.model});
+
+  factory AssistantLiveToken.fromMap(Map<String, dynamic> data) {
+    return AssistantLiveToken(
+      token: data['token']?.toString() ?? '',
+      model: data['model']?.toString() ?? 'gemini-3.8-live',
+    );
+  }
+}
+
 class AssistantChatResult {
   final String reply;
   final String model;
@@ -87,6 +101,26 @@ class AssistantRepository {
   final GeminiApiKeyStore _keyStore;
 
   AssistantRepository(this._apiClient, this._keyStore);
+
+  Future<AssistantLiveToken> createLiveToken() async {
+    final headers = await _geminiHeaders();
+
+    final result = await _apiClient.post(
+      '/api/assistant/live/token',
+      data: const <String, dynamic>{},
+      headers: headers,
+    );
+
+    final token = AssistantLiveToken.fromMap(_asMap(result));
+
+    if (token.token.isEmpty) {
+      throw const ApiException(
+        message: 'The backend did not return a Live token.',
+      );
+    }
+
+    return token;
+  }
 
   Future<AssistantChatResult> sendMessage(
     String message, {

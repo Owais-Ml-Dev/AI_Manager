@@ -38,6 +38,13 @@ from src.modules.assistant.create_flow import (
     prefill_from_message,
     selected_create_action,
 )
+from src.modules.assistant.update_flow import (
+    UPDATE_RETRY_QUESTIONS,
+    apply_update_answer,
+    attach_update_target,
+    local_update_intent,
+)
+
 from src.modules.assistant.task_parser import (
     TaskParserError,
     local_now,
@@ -272,9 +279,55 @@ def _evaluate_intent(intent, today_date):
             return preview
 
         obvious = obvious_target(candidates)
+
         if obvious is not None:
+
+            # -------------------------------------------------
+            # GUIDED UPDATE
+            # -------------------------------------------------
+            #
+            # One matching update target is selected
+            # automatically, but we must NOT immediately build
+            # an update command with empty changes.
+            #
+            # Instead:
+            #
+            # target found
+            #     ?
+            # attach selected target
+            #     ?
+            # ask "What would you like to update?"
+            #
+            if (
+                intent.get("action")
+                == "update_task"
+            ):
+                guided_intent = (
+                    attach_update_target(
+                        intent,
+                        obvious,
+                    )
+                )
+
+                guided = build_preview(
+                    guided_intent
+                )
+
+                guided.update({
+                    "target_matches":
+                        candidates,
+
+                    "selected_target_id":
+                        obvious["id"],
+                })
+
+                return guided
+
             try:
-                command = _materialize_target_command(intent, obvious)
+                command = _materialize_target_command(
+                    intent,
+                    obvious,
+                )
             except AssistantDraftError as error:
                 preview.update(
                     {
@@ -360,11 +413,23 @@ def preview_task_draft(
 
     current_action = (current_intent or {}).get("action")
     asked_field = (existing or {}).get("last_question_field")
-    answering = (
+    answering_create = (
         existing is not None
         and existing.get("status") == "needs_input"
         and current_action in CREATE_ACTIONS
         and bool(asked_field)
+    )
+
+    answering_update = (
+        existing is not None
+        and existing.get("status") == "needs_input"
+        and current_action == "update_task"
+        and bool(asked_field)
+    )
+
+    answering = (
+        answering_create
+        or answering_update
     )
 
     provider = (existing or {}).get("provider", "gemini")
@@ -374,7 +439,56 @@ def preview_task_draft(
     local_answer = None
 
     # ---- 1. Answer to our question: plain code ------------------------
-    if answering:
+
+    # -----------------------------------------------------
+    # GUIDED UPDATE ANSWER
+    # -----------------------------------------------------
+    #
+    # Examples:
+    #
+    # Assistant:
+    #   What would you like to update?
+    #
+    # User:
+    #   Title
+    #
+    # or:
+    #
+    # Assistant:
+    #   What should the new task title be?
+    #
+    # User:
+    #   Evening Gym
+    #
+    # These are deterministic answers and must never be
+    # sent to Gemini.
+    #
+    if answering_update:
+
+        updated_intent, understood = (
+            apply_update_answer(
+                asked_field,
+                current_intent,
+                message,
+                today,
+            )
+        )
+
+        if understood:
+            intent = (
+                updated_intent
+            )
+
+        else:
+            # Keep the same update draft so the backend
+            # simply asks the field again more precisely.
+            #
+            # Do NOT fall through to Gemini.
+            intent = (
+                current_intent
+            )
+
+    elif answering_create:
         task, collect, understood = apply_answer(
             asked_field,
             current_action,
@@ -448,6 +562,71 @@ def preview_task_draft(
             )
 
     # ---- 3. Gemini --------------------------------------------------------
+    # ---- UPDATE: deterministic, no Gemini -----------------
+    #
+    # Examples:
+    #
+    #   Update gym task
+    #   Edit swimming task
+    #   Change morning workout task
+    #
+    # These commands only need deterministic intent parsing.
+    # MongoDB target matching happens later.
+    #
+    if (
+        intent is None
+        and not answering
+    ):
+        deterministic_update = (
+            local_update_intent(
+                message
+            )
+        )
+
+        if deterministic_update:
+            intent = (
+                deterministic_update
+            )
+
+            provider = "local"
+
+            model = (
+                "deterministic parser"
+            )
+
+    # ---- READ/LIST: deterministic, no Gemini -----------------
+    #
+    # Show my tasks
+    # List my tasks
+    # Display the tasks
+    #
+    # Reading task data does not require Gemini.
+    #
+    if (
+        intent is None
+        and not answering
+    ):
+        deterministic_read = (
+            local_intent(
+                message,
+                today,
+            )
+        )
+
+        if (
+            isinstance(
+                deterministic_read,
+                dict,
+            )
+            and deterministic_read.get(
+                "action"
+            )
+            == "list_active_tasks"
+        ):
+            intent = deterministic_read
+            provider = "local"
+            model = "deterministic parser"
+
     if intent is None:
         try:
             parsed = parse_task_message(
@@ -550,7 +729,13 @@ def preview_task_draft(
     ):
         # The answer did not move us forward: ask more precisely.
         ask_count = int(existing.get("ask_count") or 1) + 1
-        question = RETRY_QUESTIONS.get(question_field, question)
+        question = {
+            **RETRY_QUESTIONS,
+            **UPDATE_RETRY_QUESTIONS,
+        }.get(
+            question_field,
+            question,
+        )
 
     now = _utc_now()
     fields = {
@@ -560,6 +745,7 @@ def preview_task_draft(
         "question": question,
         "missing_fields": evaluated.get("missing_fields", []),
         "validation_errors": evaluated.get("validation_errors", {}),
+        "suggestions": evaluated.get("suggestions", []),
         "duplicate_matches": evaluated.get("duplicate_matches", []),
         "target_matches": evaluated.get("target_matches", []),
         "selected_target_id": evaluated.get("selected_target_id"),
@@ -595,32 +781,209 @@ def preview_task_draft(
     return _response(document)
 
 
-def select_draft_target(draft_id, task_id):
-    draft = find_draft(draft_id)
+def select_draft_target(
+    draft_id,
+    task_id,
+):
+    draft = find_draft(
+        draft_id
+    )
+
     if draft is None:
-        raise AssistantDraftError("Assistant draft was not found or expired.", 404)
-    if draft.get("status") != "needs_target_selection":
-        raise AssistantDraftError("This draft does not need target selection.", 409)
+        raise AssistantDraftError(
+            "Assistant draft was not found or expired.",
+            404,
+        )
 
-    matches = draft.get("target_matches") or []
-    candidate = next((item for item in matches if item.get("id") == task_id), None)
+    if (
+        draft.get("status")
+        != "needs_target_selection"
+    ):
+        raise AssistantDraftError(
+            "This draft does not need target selection.",
+            409,
+        )
+
+    matches = (
+        draft.get(
+            "target_matches"
+        )
+        or []
+    )
+
+    candidate = next(
+        (
+            item
+            for item in matches
+            if item.get("id")
+            == task_id
+        ),
+        None,
+    )
+
     if candidate is None:
-        raise AssistantDraftError("Select one of the server-provided task matches.", 400)
+        raise AssistantDraftError(
+            "Select one of the server-provided task matches.",
+            400,
+        )
 
-    command = _materialize_target_command(draft.get("intent") or {}, candidate)
+    intent = (
+        draft.get("intent")
+        or {}
+    )
+
     now = _utc_now()
+
+    # -----------------------------------------------------
+    # UPDATE
+    # -----------------------------------------------------
+    #
+    # After selecting the correct task, DO NOT immediately
+    # build an update command.
+    #
+    # First ask:
+    #
+    #   What would you like to update?
+    #
+    if (
+        intent.get("action")
+        == "update_task"
+    ):
+        guided_intent = (
+            attach_update_target(
+                intent,
+                candidate,
+            )
+        )
+
+        evaluated = build_preview(
+            guided_intent
+        )
+
+        missing = (
+            evaluated.get(
+                "missing_fields"
+            )
+            or []
+        )
+
+        updated = update_draft(
+            draft_id,
+            {
+                "status":
+                    evaluated.get(
+                        "status",
+                        "needs_input",
+                    ),
+
+                "intent":
+                    evaluated.get(
+                        "intent",
+                        guided_intent,
+                    ),
+
+                "command":
+                    evaluated.get(
+                        "command"
+                    ),
+
+                "question":
+                    evaluated.get(
+                        "question"
+                    ),
+
+                "missing_fields":
+                    missing,
+
+                "validation_errors":
+                    evaluated.get(
+                        "validation_errors",
+                        {},
+                    ),
+
+                "suggestions":
+                    evaluated.get(
+                        "suggestions",
+                        [],
+                    ),
+
+                "selected_target_id":
+                    task_id,
+
+                "last_question_field":
+                    (
+                        missing[0]
+                        if (
+                            evaluated.get(
+                                "status"
+                            )
+                            == "needs_input"
+                            and missing
+                        )
+                        else None
+                    ),
+
+                "last_question_text":
+                    evaluated.get(
+                        "question"
+                    ),
+
+                "ask_count":
+                    1,
+
+                "updated_at":
+                    now,
+
+                "expires_at":
+                    now
+                    + DRAFT_TTL,
+            },
+        )
+
+        return _response(
+            updated
+        )
+
+    # -----------------------------------------------------
+    # DELETE / COMPLETE
+    # -----------------------------------------------------
+    #
+    # These do not need another field-selection step.
+    #
+    command = (
+        _materialize_target_command(
+            intent,
+            candidate,
+        )
+    )
+
     updated = update_draft(
         draft_id,
         {
-            "status": "ready",
-            "command": command,
-            "question": None,
-            "selected_target_id": task_id,
-            "updated_at": now,
-            "expires_at": now + DRAFT_TTL,
+            "status":
+                "ready",
+
+            "command":
+                command,
+
+            "question":
+                None,
+
+            "selected_target_id":
+                task_id,
+
+            "updated_at":
+                now,
+
+            "expires_at":
+                now
+                + DRAFT_TTL,
         },
     )
-    return _response(updated)
+
+    return _response(
+        updated
+    )
 
 
 def _duplicate_update_command(draft, candidate_id):

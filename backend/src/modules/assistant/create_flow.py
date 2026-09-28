@@ -893,7 +893,7 @@ def local_intent(message, today):
             },
         }
 
-    if re.search(r"\b(show|list|what are|what's|how many)\b.*\btasks?\b", text):
+    if re.search(r"\b(show|list|display|what are|what's|how many)\b.*\btasks?\b", text):
         return {"action": "list_active_tasks", "arguments": {}}
 
     if not re.search(

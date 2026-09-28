@@ -43,7 +43,13 @@
 					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
 					<key>UISceneStoryboardFile</key>
 					<string>Main</string>
-				</dict>
+				
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Microphone access is used to convert your voice into assistant messages.</string>
+
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Speech recognition is used to convert your voice into text.</string>
+</dict>
 			</array>
 		</dict>
 	</dict>

@@ -156,19 +156,17 @@ def find_target_candidates(target_text, action, today_date, limit=5):
 
 
 def obvious_target(candidates):
-    """Return the top candidate only when the title match is clearly dominant."""
+    """
+    Auto-select only when exactly one matching task exists.
+
+    When two or more tasks match, always let the user
+    choose the correct one.
+    """
 
     if not candidates:
         return None
 
-    top = candidates[0]
-    if top["score"] < AUTO_TARGET_THRESHOLD:
-        return None
-
     if len(candidates) == 1:
-        return top
-
-    if (top["score"] - candidates[1]["score"]) >= AUTO_TARGET_GAP:
-        return top
+        return candidates[0]
 
     return None

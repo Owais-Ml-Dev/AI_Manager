@@ -4,6 +4,8 @@ from flask import Blueprint
 
 from src.modules.assistant.controller import (
     assistant_chat_controller,
+    create_live_token_controller,
+    create_assistant_live_token_controller,
     delete_assistant_credential_controller,
     execute_task_command_controller,
     get_assistant_credential_controller,
@@ -40,6 +42,14 @@ assistant_bp.route("/credentials/<provider_name>", methods=["PUT"])(
 )
 assistant_bp.route("/credentials/<provider_name>", methods=["DELETE"])(
     delete_assistant_credential_controller
+)
+
+
+assistant_bp.route(
+    "/live/token",
+    methods=["POST"],
+)(
+    create_assistant_live_token_controller
 )
 
 assistant_bp.route("/chat", methods=["POST"])(

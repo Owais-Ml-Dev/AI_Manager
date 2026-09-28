@@ -1,11 +1,5 @@
 bool looksLikeTaskAction(String message) {
-  final text = message
-      .trim()
-      .toLowerCase()
-      .replaceAll(
-        RegExp(r'\s+'),
-        ' ',
-      );
+  final text = message.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
 
   if (text.isEmpty) {
     return false;
@@ -31,49 +25,29 @@ bool looksLikeTaskAction(String message) {
 
   final commandPatterns = <RegExp>[
     // Create
-    RegExp(
-      r'^(create|add|schedule|make|set|plan)\b',
-    ),
+    RegExp(r'^(create|add|schedule|make|set|plan)\b'),
 
-    RegExp(
-      r'\bremind me\b',
-    ),
+    RegExp(r'\bremind me\b'),
 
-    RegExp(
-      r'\bset (a )?reminder\b',
-    ),
+    RegExp(r'\bset (a )?reminder\b'),
 
     // Update
-    RegExp(
-      r'^(edit|update|change|rename|reschedule|move)\b',
-    ),
+    RegExp(r'^(edit|update|change|rename|reschedule|move)\b'),
 
     // Complete / Delete
-    RegExp(
-      r'^(complete|finish|delete|remove|cancel|stop)\b',
-    ),
+    RegExp(r'^(complete|finish|delete|remove|cancel|stop)\b'),
 
-    RegExp(
-      r'\bmark\b.*\b(done|complete|completed)\b',
-    ),
+    RegExp(r'\bmark\b.*\b(done|complete|completed)\b'),
 
     // Read/list
-    RegExp(
-      r'\b(show|list)\b.*\btasks?\b',
-    ),
+    RegExp(r'\b(show|list|display)\b.*\btasks?\b'),
 
-    RegExp(
-      r'\bwhat\b.*\bmy tasks?\b',
-    ),
+    RegExp(r'\bwhat\b.*\bmy tasks?\b'),
 
-    RegExp(
-      r'\bhow many\b.*\btasks?\b',
-    ),
+    RegExp(r'\bhow many\b.*\btasks?\b'),
   ];
 
-  if (commandPatterns.any(
-    (pattern) => pattern.hasMatch(text),
-  )) {
+  if (commandPatterns.any((pattern) => pattern.hasMatch(text))) {
     return true;
   }
 
@@ -93,17 +67,28 @@ bool looksLikeTaskAction(String message) {
   // even when the user does not explicitly say "create".
   //
 
-  if (RegExp(
-    r'\btasks?\b',
-  ).hasMatch(text)) {
+  if (RegExp(r'\btasks?\b').hasMatch(text)) {
     return true;
   }
 
-  if (RegExp(
-    r'\breminders?\b',
-  ).hasMatch(text)) {
+  if (RegExp(r'\breminders?\b').hasMatch(text)) {
     return true;
   }
 
   return false;
+}
+
+bool shouldInterruptTaskDraft(String message) {
+  final text = message.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+  if (text.isEmpty) {
+    return false;
+  }
+
+  // A clear read-only task command is a NEW command,
+  // even if the Assistant is currently waiting for a
+  // duration, repeat rule, reminder, etc.
+  return RegExp(r'\b(show|list|display)\b.*\btasks?\b').hasMatch(text) ||
+      RegExp(r'\bwhat\b.*\bmy tasks?\b').hasMatch(text) ||
+      RegExp(r'\bhow many\b.*\btasks?\b').hasMatch(text);
 }

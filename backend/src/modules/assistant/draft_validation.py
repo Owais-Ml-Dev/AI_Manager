@@ -14,6 +14,9 @@ from src.modules.assistant.create_flow import (
 )
 
 
+from src.modules.assistant.update_flow import build_update_preview
+
+
 DEFAULT_PRIORITY = "not_important_not_urgent"
 
 
@@ -205,19 +208,25 @@ def build_generic_preview(intent):
         }
 
     if action == "update_task":
-        changes = _normalize_task(arguments.get("changes"))
-        # Defaults are inappropriate for updates. Keep only fields the model
-        # actually extracted.
-        original_changes = arguments.get("changes")
-        changes = deepcopy(original_changes) if isinstance(original_changes, dict) else {}
-        if not changes:
-            return {
-                "status": "needs_input",
-                "missing_fields": ["changes"],
-                "question": question_for_missing("changes"),
-                "intent": intent,
-                "command": None,
-            }
+        selected_target = arguments.get(
+            "selected_target"
+        )
+
+        if (
+            isinstance(
+                selected_target,
+                dict,
+            )
+            and selected_target.get(
+                "id"
+            )
+        ):
+            guided = build_update_preview(
+                intent
+            )
+
+            if guided is not None:
+                return guided
 
     return {
         "status": "resolve_target",

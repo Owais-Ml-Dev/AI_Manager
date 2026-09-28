@@ -86,4 +86,16 @@ class TaskRepository {
       ),
     );
   }
+
+  Future<dynamic> deleteRecurringTask(String taskId) {
+    return _mutateAndSync(
+      () => _apiClient.delete('/api/tasks/recurring/$taskId'),
+    );
+  }
+
+  Future<dynamic> deleteRepeatUntilDoneTask(String taskId) {
+    return _mutateAndSync(
+      () => _apiClient.delete('/api/tasks/repeat-until-done/$taskId'),
+    );
+  }
 }

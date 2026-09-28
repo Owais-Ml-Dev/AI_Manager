@@ -1,0 +1,1822 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_sound/flutter_sound.dart';
+import 'package:record/record.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+import '../../../core/theme/app_colors.dart';
+import '../application/assistant_providers.dart';
+import '../data/assistant_repository.dart';
+import '../domain/assistant_intent.dart';
+import '../../home/application/home_providers.dart';
+import '../../history/application/history_providers.dart';
+import '../../dashboard/application/dashboard_providers.dart';
+
+enum VoiceSessionState { connecting, listening, speaking, muted, failed }
+
+class VoiceModeScreen extends ConsumerStatefulWidget {
+  const VoiceModeScreen({super.key});
+
+  @override
+  ConsumerState<VoiceModeScreen> createState() {
+    return _VoiceModeScreenState();
+  }
+}
+
+class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
+    with SingleTickerProviderStateMixin {
+  static const String _endpoint =
+      'wss://generativelanguage.googleapis.com/'
+      'ws/google.ai.generativelanguage.v1beta.'
+      'GenerativeService.BidiGenerateContentConstrained';
+
+  // =========================================================
+  // GEMINI
+  // =========================================================
+
+  WebSocketChannel? _channel;
+
+  StreamSubscription<dynamic>? _socketSubscription;
+
+  String _model = 'gemini-3.8-live';
+
+  // =========================================================
+  // MICROPHONE
+  // =========================================================
+
+  final AudioRecorder _recorder = AudioRecorder();
+
+  StreamSubscription<Uint8List>? _micSubscription;
+
+  bool _micRunning = false;
+  bool _muted = false;
+
+  // =========================================================
+  // SPEAKER
+  // =========================================================
+
+  final FlutterSoundPlayer _player = FlutterSoundPlayer();
+
+  bool _playerOpened = false;
+  bool _playerStreaming = false;
+
+  int _playbackGeneration = 0;
+
+  Future<void> _playbackChain = Future<void>.value();
+
+  // =========================================================
+  // UI
+  // =========================================================
+
+  late final AnimationController _animation;
+
+  VoiceSessionState _state = VoiceSessionState.connecting;
+
+  String _status = 'Connecting...';
+
+  String? _error;
+
+  String _userTranscript = '';
+  String _assistantTranscript = '';
+
+  // =========================================================
+  // TASK WORKFLOW
+  // =========================================================
+
+  String? _taskDraftId;
+
+  AssistantCommandPreview? _pendingTaskPreview;
+
+  Timer? _taskTranscriptTimer;
+
+  String _taskTranscriptBuffer = '';
+
+  String _lastProcessedTaskText = '';
+
+  DateTime? _lastProcessedTaskAt;
+
+  bool _processingTask = false;
+
+  String? _queuedTaskUtterance;
+
+  bool _closing = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _animation = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 800),
+    )..repeat(reverse: true);
+
+    _connect();
+  }
+
+  // =========================================================
+  // CONNECT
+  // =========================================================
+
+  Future<void> _connect() async {
+    try {
+      final token = await ref
+          .read(assistantRepositoryProvider)
+          .createLiveToken();
+
+      if (!mounted) {
+        return;
+      }
+
+      _model = token.model;
+
+      setState(() {
+        _status = 'Opening Live session...';
+      });
+
+      final uri = Uri.parse(_endpoint)
+          .replace(queryParameters: {'access_token': token.token});
+
+      debugPrint('[VOICE] Opening Gemini Live WebSocket...');
+
+      final channel = WebSocketChannel.connect(uri);
+
+      _channel = channel;
+
+      await channel.ready.timeout(const Duration(seconds: 15));
+
+      debugPrint('[VOICE] WebSocket connected.');
+
+      if (!mounted) {
+        await channel.sink.close();
+        return;
+      }
+
+      _socketSubscription = channel.stream.listen(
+        _handleSocketMessage,
+
+        onError: (Object error) {
+          debugPrint('[VOICE] WebSocket error: $error');
+
+          _fail('Gemini Live connection failed.');
+        },
+
+        onDone: () {
+          debugPrint(
+            '[VOICE] WebSocket closed. '
+            'code=${channel.closeCode} '
+            'reason=${channel.closeReason}',
+          );
+
+          if (mounted && !_closing && _state != VoiceSessionState.failed) {
+            _fail(
+              'Voice connection closed'
+              '${channel.closeCode != null ? ' '
+                        '(code ${channel.closeCode})' : ''}'
+              '${channel.closeReason != null && channel.closeReason!.isNotEmpty ? ': ${channel.closeReason}' : '.'}',
+            );
+          }
+        },
+      );
+
+      // =====================================================
+      // LIVE SETUP
+      // =====================================================
+
+      final setupMessage = {
+        'setup': {
+          'model': 'models/${token.model}',
+
+          'generationConfig': {
+            'responseModalities': ['AUDIO'],
+
+            'speechConfig': {
+              'voiceConfig': {
+                'prebuiltVoiceConfig': {'voiceName': 'Puck'},
+              },
+            },
+          },
+
+          // Gives us useful visible transcripts.
+          'inputAudioTranscription': <String, dynamic>{},
+
+          'outputAudioTranscription': <String, dynamic>{},
+
+          'systemInstruction': {
+            'parts': [
+              {
+                'text':
+                    'You are the live voice interface '
+                    'for an AI task manager. '
+                    'For ordinary conversation, respond '
+                    'naturally and concisely. '
+                    'For requests to create, update, edit, '
+                    'delete, complete, schedule, list, show, '
+                    'or otherwise manage tasks, NEVER claim '
+                    'that you performed the operation yourself. '
+                    'Briefly say "Let me check that." and wait '
+                    'for an authoritative backend response. '
+                    'When you receive a text message beginning '
+                    'with BACKEND_RESULT:, speak only the '
+                    'human-readable content after that prefix. '
+                    'Do not change task facts, dates, times, '
+                    'titles, or confirmation requirements.',
+              },
+            ],
+          },
+        },
+      };
+
+      final encoded = jsonEncode(setupMessage);
+
+      debugPrint('[VOICE] Sending setup.');
+
+      channel.sink.add(encoded);
+
+      if (mounted) {
+        setState(() {
+          _status = 'Starting voice...';
+        });
+      }
+    } on TimeoutException {
+      _fail('Voice connection timed out.');
+    } catch (error, stackTrace) {
+      debugPrint('[VOICE] Start error: $error');
+
+      debugPrint('$stackTrace');
+
+      _fail(_cleanError(error.toString()));
+    }
+  }
+
+  // =========================================================
+  // SERVER MESSAGES
+  // =========================================================
+
+  void _handleSocketMessage(dynamic raw) {
+    if (!mounted) {
+      return;
+    }
+
+    String message;
+
+    if (raw is String) {
+      message = raw;
+    } else if (raw is List<int>) {
+      try {
+        message = utf8.decode(raw);
+      } catch (_) {
+        return;
+      }
+    } else {
+      return;
+    }
+
+    Map<String, dynamic> data;
+
+    try {
+      final decoded = jsonDecode(message);
+
+      if (decoded is! Map) {
+        return;
+      }
+
+      data = decoded.map((key, value) => MapEntry(key.toString(), value));
+    } catch (error) {
+      debugPrint('[VOICE] JSON error: $error');
+
+      return;
+    }
+
+    // =====================================================
+    // SETUP COMPLETE
+    // =====================================================
+
+    if (data.containsKey('setupComplete')) {
+      debugPrint('[VOICE] setupComplete received.');
+
+      unawaited(_startAudioPipeline());
+
+      return;
+    }
+
+    // =====================================================
+    // SERVER CONTENT
+    // =====================================================
+
+    final rawContent = data['serverContent'];
+
+    if (rawContent is Map) {
+      final content = rawContent.map(
+        (key, value) => MapEntry(key.toString(), value),
+      );
+
+      // -----------------------------------------------------
+      // USER TRANSCRIPT
+      // -----------------------------------------------------
+
+      final interim = content['interimInputTranscription'];
+
+      if (interim is Map) {
+        final text = interim['text']?.toString().trim();
+
+        if (text != null && text.isNotEmpty) {
+          setState(() {
+            _userTranscript = text;
+          });
+        }
+      }
+
+      final input = content['inputTranscription'];
+
+      if (input is Map) {
+        final text = input['text']?.toString().trim();
+
+        if (text != null && text.isNotEmpty) {
+          _acceptFinalInputTranscription(text);
+        }
+      }
+
+      // -----------------------------------------------------
+      // ASSISTANT TRANSCRIPT
+      // -----------------------------------------------------
+
+      final output = content['outputTranscription'];
+
+      if (output is Map) {
+        final text = output['text']?.toString().trim();
+
+        if (text != null && text.isNotEmpty) {
+          setState(() {
+            _assistantTranscript = text;
+
+            _state = VoiceSessionState.speaking;
+
+            _status = 'Speaking...';
+          });
+        }
+      }
+
+      // -----------------------------------------------------
+      // BARGE-IN / INTERRUPTION
+      // -----------------------------------------------------
+
+      if (content['interrupted'] == true) {
+        debugPrint('[VOICE] Model interrupted by user.');
+
+        unawaited(_interruptPlayback());
+      }
+
+      // -----------------------------------------------------
+      // MODEL AUDIO
+      // -----------------------------------------------------
+
+      final rawTurn = content['modelTurn'];
+
+      if (rawTurn is Map) {
+        final rawParts = rawTurn['parts'];
+
+        if (rawParts is List) {
+          for (final rawPart in rawParts) {
+            if (rawPart is! Map) {
+              continue;
+            }
+
+            final inline = rawPart['inlineData'];
+
+            if (inline is! Map) {
+              continue;
+            }
+
+            final mime = inline['mimeType']?.toString() ?? '';
+
+            final encoded = inline['data']?.toString() ?? '';
+
+            if (!mime.startsWith('audio/pcm') || encoded.isEmpty) {
+              continue;
+            }
+
+            try {
+              final bytes = base64Decode(encoded);
+
+              _enqueueAudio(bytes);
+
+              if (mounted && !_muted) {
+                setState(() {
+                  _state = VoiceSessionState.speaking;
+
+                  _status = 'Speaking...';
+                });
+              }
+            } catch (error) {
+              debugPrint(
+                '[VOICE] Audio decode error: '
+                '$error',
+              );
+            }
+          }
+        }
+      }
+
+      // -----------------------------------------------------
+      // MODEL TURN FINISHED
+      // -----------------------------------------------------
+
+      if (content['turnComplete'] == true) {
+        if (mounted && !_muted) {
+          setState(() {
+            _state = VoiceSessionState.listening;
+
+            _status = 'Listening...';
+          });
+        }
+      }
+    }
+
+    // =====================================================
+    // GO AWAY
+    // =====================================================
+
+    if (data.containsKey('goAway')) {
+      _fail('Gemini is closing the voice session.');
+    }
+
+    // =====================================================
+    // ERROR
+    // =====================================================
+
+    if (data.containsKey('error')) {
+      _fail(
+        'Gemini Live error: '
+        '${data['error']}',
+      );
+    }
+  }
+
+  // =========================================================
+  // VOICE -> TASK BACKEND
+  // =========================================================
+
+  bool get _taskFlowActive {
+    return _taskDraftId != null || _pendingTaskPreview != null;
+  }
+
+  void _acceptFinalInputTranscription(String incoming) {
+    final spoken = incoming.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+    if (spoken.isEmpty) {
+      return;
+    }
+
+    final merged = _mergeVoiceText(_taskTranscriptBuffer, spoken);
+
+    _taskTranscriptBuffer = merged;
+
+    if (mounted) {
+      setState(() {
+        _userTranscript = merged;
+      });
+    }
+
+    _taskTranscriptTimer?.cancel();
+
+    // Gemini transcription messages can arrive in pieces.
+    // Wait briefly for the current spoken phrase to settle.
+    _taskTranscriptTimer = Timer(const Duration(milliseconds: 1000), () {
+      if (!mounted) {
+        return;
+      }
+
+      final utterance = _taskTranscriptBuffer.trim();
+
+      _taskTranscriptBuffer = '';
+
+      if (utterance.isEmpty) {
+        return;
+      }
+
+      final now = DateTime.now();
+
+      if (utterance == _lastProcessedTaskText &&
+          _lastProcessedTaskAt != null &&
+          now.difference(_lastProcessedTaskAt!).inSeconds < 3) {
+        return;
+      }
+
+      _lastProcessedTaskText = utterance;
+
+      _lastProcessedTaskAt = now;
+
+      // Normal conversation remains completely inside
+      // Gemini Live. Only task-management language is
+      // routed to Flask.
+      if (!_taskFlowActive && !looksLikeTaskAction(utterance)) {
+        return;
+      }
+
+      unawaited(_processTaskUtterance(utterance));
+    });
+  }
+
+  String _mergeVoiceText(String existing, String incoming) {
+    final left = existing.trim();
+
+    final right = incoming.trim();
+
+    if (left.isEmpty) {
+      return right;
+    }
+
+    if (right.isEmpty) {
+      return left;
+    }
+
+    final leftLower = left.toLowerCase();
+
+    final rightLower = right.toLowerCase();
+
+    // Gemini may resend the whole transcript.
+    if (rightLower.startsWith(leftLower)) {
+      return right;
+    }
+
+    if (leftLower.endsWith(rightLower)) {
+      return left;
+    }
+
+    final leftWords = left.split(RegExp(r'\s+'));
+
+    final rightWords = right.split(RegExp(r'\s+'));
+
+    final maxOverlap = leftWords.length < rightWords.length
+        ? leftWords.length
+        : rightWords.length;
+
+    for (var overlap = maxOverlap; overlap > 0; overlap--) {
+      final leftTail = leftWords
+          .sublist(leftWords.length - overlap)
+          .join(' ')
+          .toLowerCase();
+
+      final rightHead = rightWords.sublist(0, overlap).join(' ').toLowerCase();
+
+      if (leftTail == rightHead) {
+        return [...leftWords, ...rightWords.sublist(overlap)].join(' ');
+      }
+    }
+
+    return '$left $right';
+  }
+
+  String _normalizeTaskSpeech(String value) {
+    return value
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9\s]'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  bool _isConfirmSpeech(String value) {
+    final text = _normalizeTaskSpeech(value);
+
+    const confirmations = <String>{
+      'confirm',
+      'yes',
+      'yes confirm',
+      'confirm it',
+      'do it',
+      'proceed',
+      'go ahead',
+      'okay',
+      'ok',
+      'sure',
+      'yes do it',
+    };
+
+    return confirmations.contains(text) || text.startsWith('yes confirm');
+  }
+
+  bool _isCancelSpeech(String value) {
+    final text = _normalizeTaskSpeech(value);
+
+    const cancellations = <String>{
+      'cancel',
+      'no',
+      'stop',
+      'never mind',
+      'nevermind',
+      'cancel it',
+      'do not',
+      'dont',
+      'no cancel',
+    };
+
+    return cancellations.contains(text);
+  }
+
+  Future<void> _processTaskUtterance(String utterance) async {
+    if (_processingTask) {
+      _queuedTaskUtterance = utterance;
+
+      return;
+    }
+
+    _processingTask = true;
+
+    try {
+      // -----------------------------------------------------
+      // CANCEL AT ANY STAGE
+      // -----------------------------------------------------
+
+      if (_taskFlowActive && _isCancelSpeech(utterance)) {
+        _clearTaskFlow();
+
+        await _speakBackendText('Cancelled. No changes were made.');
+
+        return;
+      }
+
+      final pending = _pendingTaskPreview;
+
+      // -----------------------------------------------------
+      // TARGET SELECTION
+      // -----------------------------------------------------
+
+      if (pending != null && pending.needsTargetSelection) {
+        final match = _resolveTaskMatch(pending.targetMatches, utterance);
+
+        if (match == null) {
+          await _speakBackendText(_targetSelectionPrompt(pending));
+
+          return;
+        }
+
+        final resolved = await ref
+            .read(assistantRepositoryProvider)
+            .selectTaskTarget(draftId: pending.draftId, taskId: match.id);
+
+        _taskDraftId = resolved.draftId;
+
+        _pendingTaskPreview = null;
+
+        await _handleTaskPreview(resolved);
+
+        return;
+      }
+
+      // -----------------------------------------------------
+      // DUPLICATE REVIEW
+      // -----------------------------------------------------
+
+      if (pending != null && pending.duplicateReview) {
+        await _handleDuplicateSpeech(pending, utterance);
+
+        return;
+      }
+
+      // -----------------------------------------------------
+      // FINAL CONFIRMATION
+      // -----------------------------------------------------
+
+      if (pending != null &&
+          pending.ready &&
+          pending.action != 'list_active_tasks') {
+        if (_isConfirmSpeech(utterance)) {
+          await _executeConfirmedTask(pending);
+
+          return;
+        }
+
+        await _speakBackendText(
+          'The task change is ready. '
+          '${pending.summary}. '
+          'Say confirm to continue, '
+          'or cancel to make no changes.',
+        );
+
+        return;
+      }
+
+      // -----------------------------------------------------
+      // NEW TASK COMMAND OR ANSWER TO NEEDS_INPUT
+      // -----------------------------------------------------
+
+      final preview = await ref
+          .read(assistantRepositoryProvider)
+          .previewTaskCommand(utterance, draftId: _taskDraftId);
+
+      _taskDraftId = preview.draftId;
+
+      await _handleTaskPreview(preview);
+    } catch (error, stackTrace) {
+      debugPrint(
+        '[VOICE TASK] Error: '
+        '$error',
+      );
+
+      debugPrint('$stackTrace');
+
+      await _speakBackendText(
+        'I could not complete that task request. '
+        '${_cleanError(error.toString())}',
+      );
+    } finally {
+      _processingTask = false;
+
+      final queued = _queuedTaskUtterance;
+
+      _queuedTaskUtterance = null;
+
+      if (queued != null && queued.trim().isNotEmpty) {
+        unawaited(_processTaskUtterance(queued));
+      }
+    }
+  }
+
+  Future<void> _handleTaskPreview(AssistantCommandPreview preview) async {
+    if (preview.draftId.isNotEmpty) {
+      _taskDraftId = preview.draftId;
+    }
+
+    // -------------------------------------------------------
+    // BACKEND NEEDS AN ANSWER
+    // -------------------------------------------------------
+
+    if (preview.needsInput) {
+      _pendingTaskPreview = null;
+
+      var question = preview.question ?? 'I need a little more information.';
+
+      if (preview.suggestions.isNotEmpty) {
+        question +=
+            ' Options include '
+            '${preview.suggestions.join(', ')}.';
+      }
+
+      await _speakBackendText(question);
+
+      return;
+    }
+
+    // -------------------------------------------------------
+    // USER MUST SELECT MATCHING TASK
+    // -------------------------------------------------------
+
+    if (preview.needsTargetSelection) {
+      _pendingTaskPreview = preview;
+
+      await _speakBackendText(_targetSelectionPrompt(preview));
+
+      return;
+    }
+
+    // -------------------------------------------------------
+    // DUPLICATE TASK REVIEW
+    // -------------------------------------------------------
+
+    if (preview.duplicateReview) {
+      _pendingTaskPreview = preview;
+
+      await _speakBackendText(_duplicatePrompt(preview));
+
+      return;
+    }
+
+    // -------------------------------------------------------
+    // READY
+    // -------------------------------------------------------
+
+    if (preview.ready) {
+      if (preview.action == 'list_active_tasks') {
+        final response = await ref
+            .read(assistantRepositoryProvider)
+            .executeTaskCommand(draftId: preview.draftId, confirmed: false);
+
+        final spoken = _formatReadOnlyTasks(response);
+
+        _clearTaskFlow();
+
+        await _speakBackendText(spoken);
+
+        return;
+      }
+
+      // Never mutate immediately.
+      // Voice must still ask for confirmation.
+      _pendingTaskPreview = preview;
+
+      final summary = preview.summary.isEmpty
+          ? 'The task change is ready.'
+          : preview.summary;
+
+      await _speakBackendText(
+        '$summary. '
+        'Say confirm to continue, '
+        'or cancel to make no changes.',
+      );
+
+      return;
+    }
+
+    await _speakBackendText(
+      preview.question ?? 'I could not determine the next task step.',
+    );
+  }
+
+  String _targetSelectionPrompt(AssistantCommandPreview preview) {
+    final matches = preview.targetMatches;
+
+    if (matches.isEmpty) {
+      return preview.question ?? 'Which task did you mean?';
+    }
+
+    final names = matches.take(5).map((match) => match.title).join(', ');
+
+    return '${preview.question ?? 'Which task did you mean?'} '
+        'I found: $names. '
+        'You can say the task title, '
+        'or say first, second, or third.';
+  }
+
+  String _duplicatePrompt(AssistantCommandPreview preview) {
+    final matches = preview.duplicateMatches;
+
+    final names = matches.isEmpty
+        ? ''
+        : matches.take(5).map((match) => match.title).join(', ');
+
+    return names.isEmpty
+        ? ('A similar task already exists. '
+              'Say create new, update existing, '
+              'or cancel.')
+        : ('I found similar existing tasks: '
+              '$names. '
+              'Say create new, or say update '
+              'followed by the existing task title.');
+  }
+
+  AssistantTaskMatch? _resolveTaskMatch(
+    List<AssistantTaskMatch> matches,
+    String speech,
+  ) {
+    if (matches.isEmpty) {
+      return null;
+    }
+
+    if (matches.length == 1) {
+      return matches.first;
+    }
+
+    final input = _normalizeTaskSpeech(speech);
+
+    final ordinal = _ordinalIndex(input);
+
+    if (ordinal != null && ordinal >= 0 && ordinal < matches.length) {
+      return matches[ordinal];
+    }
+
+    final found = <AssistantTaskMatch>[];
+
+    for (final match in matches) {
+      final title = _normalizeTaskSpeech(match.title);
+
+      if (input == title ||
+          input.contains(title) ||
+          (input.isNotEmpty && title.contains(input))) {
+        found.add(match);
+      }
+    }
+
+    if (found.length == 1) {
+      return found.first;
+    }
+
+    return null;
+  }
+
+  int? _ordinalIndex(String value) {
+    final text = _normalizeTaskSpeech(value);
+
+    if (text == 'first' ||
+        text == 'one' ||
+        text == '1' ||
+        text.contains('first one')) {
+      return 0;
+    }
+
+    if (text == 'second' ||
+        text == 'two' ||
+        text == '2' ||
+        text.contains('second one')) {
+      return 1;
+    }
+
+    if (text == 'third' ||
+        text == 'three' ||
+        text == '3' ||
+        text.contains('third one')) {
+      return 2;
+    }
+
+    if (text == 'fourth' || text == 'four' || text == '4') {
+      return 3;
+    }
+
+    if (text == 'fifth' || text == 'five' || text == '5') {
+      return 4;
+    }
+
+    return null;
+  }
+
+  Future<void> _handleDuplicateSpeech(
+    AssistantCommandPreview preview,
+    String utterance,
+  ) async {
+    final normalized = _normalizeTaskSpeech(utterance);
+
+    if (normalized.contains('create new') ||
+        normalized.contains('create anyway') ||
+        normalized == 'new') {
+      await ref
+          .read(assistantRepositoryProvider)
+          .executeTaskCommand(
+            draftId: preview.draftId,
+            confirmed: true,
+            duplicateDecision: 'create_new',
+          );
+
+      _refreshTaskScreens();
+
+      final summary = preview.summary.isEmpty
+          ? 'Task created.'
+          : ('Done. '
+                '${preview.summary}');
+
+      _clearTaskFlow();
+
+      await _speakBackendText(summary);
+
+      return;
+    }
+
+    final selected = _resolveTaskMatch(preview.duplicateMatches, utterance);
+
+    final wantsExisting =
+        normalized.contains('update') ||
+        normalized.contains('existing') ||
+        normalized.contains('use') ||
+        selected != null;
+
+    if (wantsExisting) {
+      final candidate =
+          selected ??
+          (preview.duplicateMatches.length == 1
+              ? preview.duplicateMatches.first
+              : null);
+
+      if (candidate == null) {
+        await _speakBackendText(_duplicatePrompt(preview));
+
+        return;
+      }
+
+      await ref
+          .read(assistantRepositoryProvider)
+          .executeTaskCommand(
+            draftId: preview.draftId,
+            confirmed: true,
+            duplicateDecision: 'update_existing',
+            candidateId: candidate.id,
+          );
+
+      _refreshTaskScreens();
+
+      _clearTaskFlow();
+
+      await _speakBackendText(
+        'Done. The existing task '
+        '${candidate.title} was used.',
+      );
+
+      return;
+    }
+
+    await _speakBackendText(_duplicatePrompt(preview));
+  }
+
+  Future<void> _executeConfirmedTask(AssistantCommandPreview preview) async {
+    await ref
+        .read(assistantRepositoryProvider)
+        .executeTaskCommand(draftId: preview.draftId, confirmed: true);
+
+    _refreshTaskScreens();
+
+    final summary = preview.summary.isEmpty
+        ? 'The task change was completed.'
+        : ('Done. '
+              '${preview.summary}');
+
+    _clearTaskFlow();
+
+    await _speakBackendText(summary);
+  }
+
+  void _clearTaskFlow() {
+    _taskDraftId = null;
+
+    _pendingTaskPreview = null;
+
+    _queuedTaskUtterance = null;
+  }
+
+  void _refreshTaskScreens() {
+    ref.invalidate(homeDataProvider);
+
+    ref.invalidate(historyDataProvider);
+
+    ref.invalidate(dashboardDataProvider);
+  }
+
+  String _formatReadOnlyTasks(Map<String, dynamic> response) {
+    final result = _voiceAsMap(response['result']);
+
+    final recurring = _voiceAsList(result['recurring']);
+
+    final repeat = _voiceAsList(result['repeat_until_done']);
+
+    if (recurring.isEmpty && repeat.isEmpty) {
+      return 'You have no active tasks.';
+    }
+
+    final parts = <String>[];
+
+    if (recurring.isNotEmpty) {
+      final titles = recurring
+          .map((task) => task['title']?.toString() ?? 'Untitled task')
+          .join(', ');
+
+      parts.add(
+        'Your recurring tasks are '
+        '$titles.',
+      );
+    }
+
+    if (repeat.isNotEmpty) {
+      final titles = repeat
+          .map((task) => task['title']?.toString() ?? 'Untitled task')
+          .join(', ');
+
+      parts.add(
+        'Your Repeat Until Done tasks are '
+        '$titles.',
+      );
+    }
+
+    return parts.join(' ');
+  }
+
+  Map<String, dynamic> _voiceAsMap(dynamic value) {
+    if (value is! Map) {
+      return {};
+    }
+
+    return value.map((key, value) => MapEntry(key.toString(), value));
+  }
+
+  List<Map<String, dynamic>> _voiceAsList(dynamic value) {
+    if (value is! List) {
+      return [];
+    }
+
+    return value
+        .whereType<Map>()
+        .map(
+          (item) => item.map((key, value) => MapEntry(key.toString(), value)),
+        )
+        .toList();
+  }
+
+  // =========================================================
+  // SPEAK AUTHORITATIVE BACKEND RESPONSE
+  // =========================================================
+
+  Future<void> _speakBackendText(String text) async {
+    final spoken = text.trim();
+
+    if (spoken.isEmpty || _closing) {
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _assistantTranscript = spoken;
+
+        _state = VoiceSessionState.speaking;
+
+        _status = 'Speaking...';
+      });
+    }
+
+    final channel = _channel;
+
+    if (channel == null) {
+      return;
+    }
+
+    // clientContent interrupts an existing model
+    // response and causes a new model turn.
+    channel.sink.add(
+      jsonEncode({
+        'clientContent': {
+          'turns': [
+            {
+              'role': 'user',
+              'parts': [
+                {
+                  'text':
+                      'BACKEND_RESULT: '
+                      '$spoken',
+                },
+              ],
+            },
+          ],
+          'turnComplete': true,
+        },
+      }),
+    );
+  }
+
+  // =========================================================
+  // START AUDIO
+  // =========================================================
+
+  Future<void> _startAudioPipeline() async {
+    try {
+      final allowed = await _recorder.hasPermission();
+
+      if (!allowed) {
+        _fail(
+          'Microphone permission is required '
+          'for Voice Mode.',
+        );
+
+        return;
+      }
+
+      // -----------------------------------------------------
+      // SPEAKER
+      // -----------------------------------------------------
+
+      if (!_playerOpened) {
+        await _player.openPlayer();
+
+        _playerOpened = true;
+      }
+
+      await _startPlayerStream();
+
+      // -----------------------------------------------------
+      // MICROPHONE
+      //
+      // 16 kHz
+      // mono
+      // PCM 16-bit
+      //
+      // 1280 bytes ? 40 ms:
+      //
+      // 16000 samples/sec
+      // ? 2 bytes/sample
+      // ? 0.04 sec
+      // = 1280
+      // -----------------------------------------------------
+
+      final stream = await _recorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+
+          sampleRate: 16000,
+
+          numChannels: 1,
+
+          streamBufferSize: 1280,
+
+          echoCancel: true,
+
+          noiseSuppress: true,
+
+          autoGain: true,
+
+          androidConfig: AndroidRecordConfig(
+            speakerphone: true,
+
+            audioSource: AndroidAudioSource.voiceCommunication,
+
+            audioManagerMode: AudioManagerMode.modeInCommunication,
+          ),
+        ),
+      );
+
+      _micRunning = true;
+
+      _micSubscription = stream.listen(
+        _sendMicrophoneChunk,
+
+        onError: (Object error) {
+          debugPrint('[VOICE] Mic error: $error');
+
+          _fail('Microphone streaming failed.');
+        },
+      );
+
+      if (mounted && !_muted) {
+        setState(() {
+          _state = VoiceSessionState.listening;
+
+          _status = 'Listening...';
+        });
+      }
+
+      debugPrint('[VOICE] Microphone streaming started.');
+    } catch (error, stackTrace) {
+      debugPrint(
+        '[VOICE] Audio pipeline error: '
+        '$error',
+      );
+
+      debugPrint('$stackTrace');
+
+      _fail(
+        'Could not start microphone/audio: '
+        '$error',
+      );
+    }
+  }
+
+  // =========================================================
+  // SEND MICROPHONE TO GEMINI
+  // =========================================================
+
+  void _sendMicrophoneChunk(Uint8List bytes) {
+    if (_closing || _muted || bytes.isEmpty) {
+      return;
+    }
+
+    final channel = _channel;
+
+    if (channel == null) {
+      return;
+    }
+
+    final message = {
+      'realtimeInput': {
+        'audio': {
+          'data': base64Encode(bytes),
+
+          'mimeType': 'audio/pcm;rate=16000',
+        },
+      },
+    };
+
+    channel.sink.add(jsonEncode(message));
+  }
+
+  // =========================================================
+  // PCM PLAYBACK
+  // =========================================================
+
+  Future<void> _startPlayerStream() async {
+    if (!_playerOpened || _playerStreaming) {
+      return;
+    }
+
+    await _player.startPlayerFromStream(
+      codec: Codec.pcm16,
+
+      interleaved: true,
+
+      numChannels: 1,
+
+      sampleRate: 24000,
+
+      bufferSize: 4800,
+    );
+
+    _playerStreaming = true;
+
+    debugPrint('[VOICE] 24 kHz PCM speaker stream ready.');
+  }
+
+  void _enqueueAudio(Uint8List bytes) {
+    final generation = _playbackGeneration;
+
+    _playbackChain = _playbackChain
+        .then((_) async {
+          if (_closing ||
+              !_playerStreaming ||
+              generation != _playbackGeneration) {
+            return;
+          }
+
+          await _player.feedUint8FromStream(bytes);
+        })
+        .catchError((Object error, StackTrace stackTrace) {
+          debugPrint('[VOICE] Playback error: $error');
+        });
+  }
+
+  // =========================================================
+  // BARGE-IN
+  // =========================================================
+
+  Future<void> _interruptPlayback() async {
+    _playbackGeneration++;
+
+    _playbackChain = Future<void>.value();
+
+    if (_playerStreaming) {
+      try {
+        await _player.stopPlayer();
+      } catch (_) {}
+
+      _playerStreaming = false;
+    }
+
+    if (!_closing && _playerOpened) {
+      await _startPlayerStream();
+    }
+
+    if (mounted && !_muted) {
+      setState(() {
+        _state = VoiceSessionState.listening;
+
+        _status = 'Listening...';
+      });
+    }
+  }
+
+  // =========================================================
+  // MUTE
+  // =========================================================
+
+  Future<void> _toggleMute() async {
+    if (!_micRunning || _closing) {
+      return;
+    }
+
+    try {
+      if (!_muted) {
+        await _recorder.pause();
+
+        _channel?.sink.add(
+          jsonEncode({
+            'realtimeInput': {'audioStreamEnd': true},
+          }),
+        );
+
+        if (mounted) {
+          setState(() {
+            _muted = true;
+
+            _state = VoiceSessionState.muted;
+
+            _status = 'Microphone muted';
+          });
+        }
+      } else {
+        await _recorder.resume();
+
+        if (mounted) {
+          setState(() {
+            _muted = false;
+
+            _state = VoiceSessionState.listening;
+
+            _status = 'Listening...';
+          });
+        }
+      }
+    } catch (error) {
+      debugPrint('[VOICE] Mute error: $error');
+    }
+  }
+
+  // =========================================================
+  // CLEANUP
+  // =========================================================
+
+  Future<void> _close() async {
+    if (_closing) {
+      return;
+    }
+
+    _closing = true;
+
+    await _shutdownAudio();
+
+    await _socketSubscription?.cancel();
+
+    await _channel?.sink.close();
+
+    if (mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  Future<void> _shutdownAudio() async {
+    await _micSubscription?.cancel();
+
+    _micSubscription = null;
+
+    try {
+      if (await _recorder.isRecording()) {
+        await _recorder.stop();
+      }
+    } catch (_) {}
+
+    _micRunning = false;
+
+    try {
+      await _recorder.dispose();
+    } catch (_) {}
+
+    _playbackGeneration++;
+
+    try {
+      if (_playerStreaming) {
+        await _player.stopPlayer();
+      }
+    } catch (_) {}
+
+    _playerStreaming = false;
+
+    try {
+      if (_playerOpened) {
+        await _player.closePlayer();
+      }
+    } catch (_) {}
+
+    _playerOpened = false;
+  }
+
+  // =========================================================
+  // ERROR
+  // =========================================================
+
+  String _cleanError(String value) {
+    return value
+        .replaceFirst('ApiException: ', '')
+        .replaceFirst('Exception: ', '');
+  }
+
+  void _fail(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _state = VoiceSessionState.failed;
+
+      _status = 'Could not start Voice';
+
+      _error = message;
+    });
+  }
+
+  @override
+  void dispose() {
+    _closing = true;
+
+    _socketSubscription?.cancel();
+
+    _micSubscription?.cancel();
+
+    unawaited(_channel?.sink.close() ?? Future<void>.value());
+
+    unawaited(_recorder.dispose());
+
+    if (_playerOpened) {
+      unawaited(_player.closePlayer());
+    }
+
+    _animation.dispose();
+
+    super.dispose();
+  }
+
+  // =========================================================
+  // UI
+  // =========================================================
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = AppColors.of(context);
+
+    final speaking = _state == VoiceSessionState.speaking;
+
+    final listening = _state == VoiceSessionState.listening;
+
+    final failed = _state == VoiceSessionState.failed;
+
+    return Scaffold(
+      backgroundColor: colors.background,
+
+      body: SafeArea(
+        child: Column(
+          children: [
+            // =================================================
+            // HEADER
+            // =================================================
+
+            Padding(
+              padding: const EdgeInsets.fromLTRB(18, 8, 10, 0),
+              child: Row(
+                children: [
+                  Text(
+                    'Voice',
+                    style: TextStyle(
+                      color: colors.textPrimary,
+
+                      fontSize: 18,
+
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+
+                  const Spacer(),
+
+                  IconButton(
+                    tooltip: 'End Voice',
+
+                    onPressed: _close,
+
+                    icon: const Icon(Icons.close_rounded),
+                  ),
+                ],
+              ),
+            ),
+
+            // =================================================
+            // CENTRE
+            // =================================================
+            Expanded(
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 26),
+
+                  child: AnimatedBuilder(
+                    animation: _animation,
+
+                    builder: (context, child) {
+                      final pulse = (listening || speaking)
+                          ? (1.0 + _animation.value * 0.055)
+                          : 1.0;
+
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
+
+                        children: [
+                          Transform.scale(
+                            scale: pulse,
+
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 250),
+
+                              width: 155,
+
+                              height: 155,
+
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+
+                                color: failed
+                                    ? Colors.red.withValues(alpha: 0.12)
+                                    : speaking
+                                    ? Theme.of(context).colorScheme.primary
+                                          .withValues(alpha: 0.30)
+                                    : colors.surfaceElevated,
+
+                                border: Border.all(
+                                  color: failed
+                                      ? Colors.red
+                                      : speaking
+                                      ? Theme.of(context).colorScheme.primary
+                                      : colors.textMuted,
+                                ),
+                              ),
+
+                              child: Icon(
+                                failed
+                                    ? Icons.error_outline_rounded
+                                    : speaking
+                                    ? Icons.graphic_eq_rounded
+                                    : _muted
+                                    ? Icons.mic_off_rounded
+                                    : Icons.graphic_eq_rounded,
+
+                                size: 64,
+
+                                color: failed ? Colors.red : colors.textPrimary,
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 30),
+
+                          Text(
+                            _status,
+                            textAlign: TextAlign.center,
+
+                            style: TextStyle(
+                              color: colors.textPrimary,
+
+                              fontSize: 22,
+
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+
+                          const SizedBox(height: 12),
+
+                          if (failed)
+                            Text(
+                              _error ?? 'Unknown Voice error.',
+
+                              textAlign: TextAlign.center,
+
+                              style: TextStyle(
+                                color: colors.textSecondary,
+
+                                fontSize: 13,
+
+                                height: 1.45,
+                              ),
+                            )
+                          else ...[
+                            if (_userTranscript.isNotEmpty)
+                              Text(
+                                'You: '
+                                '$_userTranscript',
+
+                                textAlign: TextAlign.center,
+
+                                maxLines: 3,
+
+                                overflow: TextOverflow.ellipsis,
+
+                                style: TextStyle(
+                                  color: colors.textSecondary,
+
+                                  fontSize: 13,
+
+                                  height: 1.4,
+                                ),
+                              ),
+
+                            if (_assistantTranscript.isNotEmpty) ...[
+                              const SizedBox(height: 8),
+
+                              Text(
+                                'Assistant: '
+                                '$_assistantTranscript',
+
+                                textAlign: TextAlign.center,
+
+                                maxLines: 4,
+
+                                overflow: TextOverflow.ellipsis,
+
+                                style: TextStyle(
+                                  color: colors.textPrimary,
+
+                                  fontSize: 14,
+
+                                  height: 1.4,
+                                ),
+                              ),
+                            ],
+
+                            if (_userTranscript.isEmpty &&
+                                _assistantTranscript.isEmpty)
+                              Text(
+                                _state == VoiceSessionState.connecting
+                                    ? 'Creating a secure '
+                                          'Gemini Live session...'
+                                    : 'Connected to '
+                                          '$_model',
+
+                                textAlign: TextAlign.center,
+
+                                style: TextStyle(
+                                  color: colors.textSecondary,
+
+                                  fontSize: 13,
+                                ),
+                              ),
+                          ],
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ),
+            ),
+
+            // =================================================
+            // CONTROLS
+            // =================================================
+            Padding(
+              padding: const EdgeInsets.fromLTRB(24, 10, 24, 28),
+
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+
+                children: [
+                  _VoiceButton(
+                    tooltip: _muted ? 'Unmute' : 'Mute',
+
+                    icon: _muted ? Icons.mic_off_rounded : Icons.mic_rounded,
+
+                    onTap: _micRunning ? _toggleMute : null,
+                  ),
+
+                  const SizedBox(width: 22),
+
+                  _VoiceButton(
+                    tooltip: 'End Voice',
+
+                    icon: Icons.close_rounded,
+
+                    destructive: true,
+
+                    onTap: _close,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _VoiceButton extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onTap;
+  final bool destructive;
+
+  const _VoiceButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onTap,
+    this.destructive = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = AppColors.of(context);
+
+    return Tooltip(
+      message: tooltip,
+
+      child: InkWell(
+        onTap: onTap,
+
+        borderRadius: BorderRadius.circular(40),
+
+        child: Container(
+          width: 62,
+
+          height: 62,
+
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+
+            color: destructive
+                ? Colors.red.withValues(alpha: 0.16)
+                : colors.surfaceElevated,
+
+            border: Border.all(color: colors.border),
+          ),
+
+          child: Icon(
+            icon,
+
+            size: 27,
+
+            color: onTap == null
+                ? colors.textMuted
+                : destructive
+                ? Colors.red
+                : colors.textPrimary,
+          ),
+        ),
+      ),
+    );
+  }
+}

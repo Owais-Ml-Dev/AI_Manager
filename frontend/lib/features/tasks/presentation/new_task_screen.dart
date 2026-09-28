@@ -916,9 +916,7 @@ class _NewTaskScreenState extends ConsumerState<NewTaskScreen> {
     }
 
     if (_endDate.isBefore(_startDate)) {
-      _showMessage(
-        'End date cannot be before start date.',
-      );
+      _showMessage('End date cannot be before start date.');
       return false;
     }
 
@@ -985,14 +983,8 @@ class _NewTaskScreenState extends ConsumerState<NewTaskScreen> {
     };
 
     payload['duration'] = {
-      'start_date':
-          DateFormat('yyyy-MM-dd').format(
-        _startDate,
-      ),
-      'end_date':
-          DateFormat('yyyy-MM-dd').format(
-        _endDate,
-      ),
+      'start_date': DateFormat('yyyy-MM-dd').format(_startDate),
+      'end_date': DateFormat('yyyy-MM-dd').format(_endDate),
     };
 
     try {

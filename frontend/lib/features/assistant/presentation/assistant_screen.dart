@@ -1,3 +1,5 @@
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,6 +14,7 @@ import '../application/assistant_providers.dart';
 import '../data/assistant_repository.dart';
 import '../domain/assistant_intent.dart';
 import '../domain/assistant_message.dart';
+import 'voice_mode_screen.dart';
 
 class AssistantScreen extends ConsumerStatefulWidget {
   const AssistantScreen({super.key});
@@ -34,15 +37,348 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
   // Quick-reply chips for the question currently being asked.
   List<String> _suggestions = const [];
 
+  // ========================================================
+  // VOICE TO TEXT
+  // ========================================================
+
+  final stt.SpeechToText _speechToText = stt.SpeechToText();
+
+  bool _speechInitialized = false;
+  bool _speechAvailable = false;
+  bool _isListening = false;
+
+  // True from the moment the user taps the microphone
+  // until they explicitly tap it again.
+  bool _voiceModeActive = false;
+
+  // Text that existed before the current dictation started.
+  // Partial speech results are appended to this instead of
+  // repeatedly duplicating recognized words.
+  String _speechPrefix = '';
+  String _speechCommitted = '';
+
   @override
   void dispose() {
     _activeCancelToken?.cancel('Assistant screen closed.');
+
+    _speechToText.cancel();
     _messageController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
+  Future<bool> _initializeSpeech() async {
+    if (_speechInitialized) {
+      return _speechAvailable;
+    }
+
+    try {
+      final available = await _speechToText.initialize(
+        onStatus: _onSpeechStatus,
+        onError: (error) {
+          if (!mounted) {
+            return;
+          }
+
+          setState(() {
+            _isListening = false;
+          });
+
+          final code = error.errorMsg.toString();
+
+          // -------------------------------------------------
+          // NORMAL SPEECH END CONDITIONS
+          // -------------------------------------------------
+          //
+          // Android can report these when:
+          //
+          // - the user stayed silent
+          // - speech could not be recognized
+          //
+          // They are not application failures.
+          //
+          if (code == 'error_speech_timeout' || code == 'error_no_match') {
+            return;
+          }
+
+          // Only show genuinely useful errors.
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('Voice input stopped: $code')));
+        },
+
+        // We only need the phone microphone.
+        // This avoids requiring Bluetooth permissions.
+        options: [stt.SpeechToText.androidNoBluetooth],
+      );
+
+      if (!mounted) {
+        return available;
+      }
+
+      setState(() {
+        _speechInitialized = true;
+        _speechAvailable = available;
+      });
+
+      return available;
+    } catch (_) {
+      if (!mounted) {
+        return false;
+      }
+
+      setState(() {
+        _speechInitialized = true;
+        _speechAvailable = false;
+        _isListening = false;
+      });
+
+      return false;
+    }
+  }
+
+  void _onSpeechStatus(String status) {
+    if (!mounted) {
+      return;
+    }
+
+    final listening = status == stt.SpeechToText.listeningStatus;
+
+    setState(() {
+      _isListening = listening;
+    });
+
+    // Android speech recognition can automatically
+    // finish a listening session after silence.
+    //
+    // If the user still has voice mode enabled,
+    // immediately start another recognition session.
+  }
+
+  void _onSpeechResult(SpeechRecognitionResult result) {
+    final spoken = result.recognizedWords
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    if (spoken.isEmpty) {
+      return;
+    }
+
+    // =====================================================
+    // IMPORTANT
+    // =====================================================
+    //
+    // Android speech recognition can revise or reset its
+    // partial hypothesis while the user is still speaking.
+    //
+    // Therefore we merge EVERY speech result into our
+    // persistent transcript instead of replacing the
+    // TextField with recognizedWords.
+    //
+    // Example:
+    //
+    // existing:
+    //   "hello this is the best"
+    //
+    // next result:
+    //   "this is the best application"
+    //
+    // result:
+    //   "hello this is the best application"
+    //
+    // Earlier speech can never disappear.
+
+    _speechCommitted = _mergeSpeechText(_speechCommitted, spoken);
+
+    final parts = <String>[
+      if (_speechPrefix.trim().isNotEmpty) _speechPrefix.trim(),
+
+      if (_speechCommitted.trim().isNotEmpty) _speechCommitted.trim(),
+    ];
+
+    final combined = parts.join(' ');
+
+    if (_messageController.text == combined) {
+      return;
+    }
+
+    _messageController.value = TextEditingValue(
+      text: combined,
+      selection: TextSelection.collapsed(offset: combined.length),
+    );
+  }
+
+  String _mergeSpeechText(String existing, String incoming) {
+    final left = existing.trim();
+
+    final right = incoming.trim();
+
+    if (left.isEmpty) {
+      return right;
+    }
+
+    if (right.isEmpty) {
+      return left;
+    }
+
+    // Recognition engines sometimes resend the entire
+    // sentence instead of only the newest phrase.
+    if (right.toLowerCase().startsWith(left.toLowerCase())) {
+      return right;
+    }
+
+    if (left.toLowerCase().endsWith(right.toLowerCase())) {
+      return left;
+    }
+
+    // Find overlapping words so:
+    //
+    // "create gym task tomorrow"
+    // +
+    // "task tomorrow at seven"
+    //
+    // becomes:
+    //
+    // "create gym task tomorrow at seven"
+    //
+    final leftWords = left.split(RegExp(r'\s+'));
+
+    final rightWords = right.split(RegExp(r'\s+'));
+
+    final maxOverlap = leftWords.length < rightWords.length
+        ? leftWords.length
+        : rightWords.length;
+
+    for (var overlap = maxOverlap; overlap > 0; overlap--) {
+      final leftTail = leftWords
+          .sublist(leftWords.length - overlap)
+          .join(' ')
+          .toLowerCase();
+
+      final rightHead = rightWords.sublist(0, overlap).join(' ').toLowerCase();
+
+      if (leftTail == rightHead) {
+        return [...leftWords, ...rightWords.sublist(overlap)].join(' ');
+      }
+    }
+
+    return '$left $right';
+  }
+
+  Future<void> _startListeningSession() async {
+    if (!_voiceModeActive || _sending || _speechToText.isListening) {
+      return;
+    }
+
+    // Preserve everything already dictated.
+
+    try {
+      await _speechToText.listen(
+        onResult: _onSpeechResult,
+
+        listenOptions: stt.SpeechListenOptions(
+          listenMode: stt.ListenMode.dictation,
+
+          partialResults: true,
+
+          cancelOnError: false,
+
+          autoPunctuation: true,
+
+          // Android may still stop earlier.
+          // We automatically restart when it does.
+          listenFor: const Duration(minutes: 5),
+
+          pauseFor: const Duration(seconds: 10),
+        ),
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isListening = _speechToText.isListening;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _toggleVoiceInput() async {
+    if (_sending) {
+      return;
+    }
+
+    // =====================================================
+    // USER STOPS VOICE MODE
+    // =====================================================
+
+    if (_voiceModeActive) {
+      _voiceModeActive = false;
+
+      await _speechToText.stop();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isListening = false;
+      });
+
+      return;
+    }
+
+    // =====================================================
+    // USER STARTS VOICE MODE
+    // =====================================================
+
+    final available = await _initializeSpeech();
+
+    if (!available) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Microphone or speech recognition is unavailable.'),
+        ),
+      );
+
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    // Start one fresh dictation buffer.
+    //
+    // Anything already typed remains untouched.
+    _speechPrefix = _messageController.text.trim();
+
+    _speechCommitted = '';
+
+    setState(() {
+      _voiceModeActive = true;
+    });
+
+    await _startListeningSession();
+  }
+
   Future<void> _send() async {
+    _voiceModeActive = false;
+
+    if (_speechToText.isListening || _isListening) {
+      await _speechToText.stop();
+
+      if (mounted) {
+        setState(() {
+          _isListening = false;
+        });
+      }
+    }
+
     final message = _messageController.text.trim();
     if (message.isEmpty || _sending) return;
 
@@ -68,8 +404,27 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
     });
     _scrollToBottom();
 
-    // When the backend has an unfinished draft, the next message is always a
-    // continuation even if it is just "14 days" or "8 PM".
+    // Normally an unfinished draft consumes the next answer.
+    //
+    // But read-only commands such as:
+    //
+    //   "Show my tasks"
+    //   "Display the tasks"
+    //
+    // start a fresh command instead of being interpreted
+    // as the answer to the current draft question.
+    final interruptDraft =
+        _activeDraftId != null && shouldInterruptTaskDraft(message);
+
+    if (interruptDraft) {
+      setState(() {
+        _activeDraftId = null;
+        _pendingCommand = null;
+        _selectedMatchId = null;
+        _suggestions = const [];
+      });
+    }
+
     if (_activeDraftId != null || looksLikeTaskAction(message)) {
       await _previewTaskCommand(message);
     } else {
@@ -165,11 +520,66 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
           .read(assistantRepositoryProvider)
           .selectTaskTarget(draftId: preview.draftId, taskId: taskId);
       if (!mounted) return;
+
+      // ---------------------------------------------------
+      // GUIDED UPDATE AFTER TARGET SELECTION
+      // ---------------------------------------------------
+      //
+      // Example:
+      //
+      // Update gym task
+      //     ?
+      // multiple matches
+      //     ?
+      // user selects one
+      //     ?
+      // backend returns needs_input:
+      //
+      // "What would you like to update?"
+      //
+      // That response must become a normal assistant
+      // question with suggestion chips. It must NOT be
+      // rendered as a confirmation card yet.
+      //
+      if (resolved.needsInput) {
+        setState(() {
+          _pendingCommand = null;
+
+          _activeDraftId = resolved.draftId;
+
+          _selectedMatchId = null;
+
+          _suggestions = resolved.suggestions;
+
+          _messages.add(
+            AssistantMessage(
+              text: resolved.question ?? 'What would you like to update?',
+
+              fromUser: false,
+
+              model: resolved.model,
+            ),
+          );
+        });
+
+        _scrollToBottom();
+
+        return;
+      }
+
+      // Delete / Complete / other actions may become
+      // immediately ready after selecting a target.
       setState(() {
         _pendingCommand = resolved;
+
         _activeDraftId = resolved.draftId;
+
         _selectedMatchId = null;
+
+        _suggestions = const [];
       });
+
+      _scrollToBottom();
     } on ApiException catch (error) {
       _addError(error.message);
     } catch (_) {
@@ -262,6 +672,38 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
     ref.invalidate(homeDataProvider);
     ref.invalidate(historyDataProvider);
     ref.invalidate(dashboardDataProvider);
+  }
+
+  Future<void> _openLiveVoice() async {
+    if (_sending) {
+      return;
+    }
+
+    // Dictation mic and Live Voice must never
+    // use the microphone at the same time.
+    _voiceModeActive = false;
+
+    if (_speechToText.isListening || _isListening) {
+      await _speechToText.stop();
+
+      if (mounted) {
+        setState(() {
+          _isListening = false;
+        });
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) {
+          return const VoiceModeScreen();
+        },
+      ),
+    );
   }
 
   void _openNewTask() {
@@ -505,6 +947,7 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
 
   Widget _inputArea() {
     final colors = AppColors.of(context);
+
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
       color: colors.background,
@@ -519,37 +962,91 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.end,
           children: [
+            // =================================================
+            // NEW TASK
+            // =================================================
+
             IconButton(
-              onPressed: _openNewTask,
-              visualDensity: VisualDensity.compact,
-              icon: Icon(Icons.add, size: 22, color: colors.textSecondary),
+              tooltip: 'New task',
+              onPressed: _sending || _isListening ? null : _openNewTask,
+              icon: const Icon(Icons.add, size: 22),
+              color: colors.textSecondary,
             ),
+
+            // =================================================
+            // TEXT / SPEECH RESULT
+            // =================================================
             Expanded(
               child: TextField(
                 controller: _messageController,
                 minLines: 1,
                 maxLines: 5,
                 textCapitalization: TextCapitalization.sentences,
-                onSubmitted: (_) => _send(),
-                style: TextStyle(color: colors.textPrimary, fontSize: 14),
+                onSubmitted: (_) {
+                  _send();
+                },
                 decoration: InputDecoration(
-                  hintText: _activeDraftId == null
-                      ? 'Message Assistant'
-                      : 'Reply with the missing detail',
-                  hintStyle: TextStyle(color: colors.textMuted),
-                  filled: false,
-                  isDense: true,
+                  hintText: _isListening ? 'Listening...' : 'Message Assistant',
                   border: InputBorder.none,
                   enabledBorder: InputBorder.none,
                   focusedBorder: InputBorder.none,
+                  filled: false,
+                  isDense: true,
                   contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 6,
+                    horizontal: 4,
                     vertical: 12,
                   ),
                 ),
               ),
             ),
+
+            // =================================================
+            // MICROPHONE
+            // =================================================
+            IconButton(
+              tooltip: _isListening ? 'Stop listening' : 'Voice input',
+              onPressed: _sending ? null : _toggleVoiceInput,
+              style: IconButton.styleFrom(
+                minimumSize: const Size(42, 42),
+                maximumSize: const Size(42, 42),
+                backgroundColor: _isListening
+                    ? Theme.of(context).colorScheme.primary
+                          .withValues(alpha: 0.16)
+                    : Colors.transparent,
+              ),
+              icon: Icon(
+                _isListening ? Icons.mic_rounded : Icons.mic_none_rounded,
+                size: 22,
+                color: _isListening
+                    ? Theme.of(context).colorScheme.primary
+                    : colors.textPrimary,
+              ),
+            ),
+
+            const SizedBox(width: 2),
+
+            // =================================================
+            // LIVE VOICE
+            // =================================================
+            IconButton(
+              tooltip: 'Start Voice',
+              onPressed: _sending ? null : _openLiveVoice,
+
+              style: IconButton.styleFrom(
+                minimumSize: const Size(42, 42),
+                maximumSize: const Size(42, 42),
+                backgroundColor: Theme.of(context).colorScheme.primary,
+                foregroundColor: Colors.white,
+              ),
+
+              icon: const Icon(Icons.graphic_eq_rounded, size: 22),
+            ),
+
             const SizedBox(width: 4),
+
+            // =================================================
+            // SEND / STOP AI RESPONSE
+            // =================================================
             IconButton(
               onPressed: _activeCancelToken != null
                   ? _stopGenerating
@@ -814,9 +1311,7 @@ class _CommandDetails extends StatelessWidget {
 
       final duration = _asMap(task['duration']);
       if (duration.isNotEmpty) {
-        rows.add(
-          'Dates: ${duration['start_date']} to ${duration['end_date']}',
-        );
+        rows.add('Dates: ${duration['start_date']} to ${duration['end_date']}');
       }
 
       final repeat = _asMap(task['repeat']);
@@ -835,7 +1330,9 @@ class _CommandDetails extends StatelessWidget {
           final reminder = _asMap(item);
           if (reminder.isEmpty) continue;
           final count = reminder['count'];
-          final times = (count is int && count > 1) ? ' ($count reminders)' : '';
+          final times = (count is int && count > 1)
+              ? ' ($count reminders)'
+              : '';
           rows.add(
             'Reminder window $number: '
             '${reminder['start_time']} - ${reminder['end_time']}$times',

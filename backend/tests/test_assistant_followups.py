@@ -97,6 +97,7 @@ def test_recurring_order():
     asked, task = _fields_in_order(
         "create_recurring_task",
         [
+            "Recurring",
             "from today to 15 oct",
             "weekdays",
             "2",
@@ -108,6 +109,7 @@ def test_recurring_order():
     )
 
     assert asked == [
+        "task_type",
         "duration",
         "repeat",
         "reminders.count",
@@ -123,6 +125,7 @@ def test_repeat_until_done_order():
     asked, _ = _fields_in_order(
         "create_repeat_until_done_task",
         [
+            "Repeat Until Done",
             "from today to 15 oct",
             "everyday",
             "1",
@@ -133,6 +136,7 @@ def test_repeat_until_done_order():
     )
 
     assert asked == [
+        "task_type",
         "duration",
         "repeat",
         "reminders.count",
@@ -189,6 +193,7 @@ def test_screenshot_conversation(app, monkeypatch):
     with app.app_context():
         result = _run([
             "Add buy task",
+            "Repeat Until Done",
             "today for 2 weeks",
             "Everyday",
             "1",
@@ -226,6 +231,7 @@ def test_gemini_down_still_creates(app, monkeypatch):
     with app.app_context():
         result = _run([
             "Create buy",
+            "Repeat Until Done",
             "today for 2 weeks",
             "weekends",
             "1",

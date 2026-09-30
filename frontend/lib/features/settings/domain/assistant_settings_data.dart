@@ -21,8 +21,13 @@ class AssistantProviderSettings {
 class AssistantSettingsData {
   final List<AssistantProviderSettings> providers;
   final String message;
+  final bool autoFallback;
 
-  const AssistantSettingsData({required this.providers, this.message = ''});
+  const AssistantSettingsData({
+    required this.providers,
+    this.message = '',
+    this.autoFallback = true,
+  });
 
   AssistantProviderSettings? provider(String name) {
     for (final item in providers) {

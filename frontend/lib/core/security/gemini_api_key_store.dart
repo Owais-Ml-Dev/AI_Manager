@@ -7,6 +7,15 @@ class GeminiApiKeyStore {
   static const _cloudflareAccountIdKey = 'cloudflare_account_id';
   static const _openRouterKey = 'openrouter_api_key';
 
+  static const _cerebrasKey = 'cerebras_api_key';
+
+  static const _mistralKey = 'mistral_api_key';
+
+  static const _nvidiaKey = 'nvidia_api_key';
+  static const _autoFallbackKey = 'ai_auto_fallback';
+
+  static const _preferredProviderKey = 'ai_preferred_provider';
+
   final FlutterSecureStorage _storage;
 
   const GeminiApiKeyStore({this._storage = const FlutterSecureStorage()});
@@ -21,6 +30,15 @@ class GeminiApiKeyStore {
         return _cloudflareTokenKey;
       case 'openrouter':
         return _openRouterKey;
+
+      case 'cerebras':
+        return _cerebrasKey;
+
+      case 'mistral':
+        return _mistralKey;
+
+      case 'nvidia':
+        return _nvidiaKey;
       default:
         throw ArgumentError('Unsupported AI provider: $provider');
     }
@@ -62,6 +80,66 @@ class GeminiApiKeyStore {
 
   Future<void> deleteCloudflareAccountId() {
     return _storage.delete(key: _cloudflareAccountIdKey);
+  }
+
+  Future<bool> readAutoFallback() async {
+    final value = await _storage.read(key: _autoFallbackKey);
+
+    // Default to ON for existing installations.
+    if (value == null) {
+      return true;
+    }
+
+    return value.trim().toLowerCase() != 'false';
+  }
+
+  Future<void> saveAutoFallback(bool enabled) {
+    return _storage.write(
+      key: _autoFallbackKey,
+      value: enabled ? 'true' : 'false',
+    );
+  }
+
+  Future<String> readPreferredProvider() async {
+    final value = await _storage.read(key: _preferredProviderKey);
+
+    const supported = {
+      'gemini',
+      'groq',
+      'cloudflare',
+      'openrouter',
+      'cerebras',
+      'mistral',
+      'nvidia',
+    };
+
+    final normalized = value?.trim().toLowerCase();
+
+    if (normalized == null || !supported.contains(normalized)) {
+      return 'gemini';
+    }
+
+    return normalized;
+  }
+
+  Future<void> savePreferredProvider(String provider) async {
+    final normalized = provider.trim().toLowerCase();
+
+    const supported = {
+      'gemini',
+      'groq',
+      'cloudflare',
+      'openrouter',
+      'cerebras',
+      'mistral',
+      'nvidia',
+    };
+
+    if (!supported.contains(normalized)) {
+      throw ArgumentError('Unsupported AI provider: $provider');
+    }
+
+    await _storage.write(key: _preferredProviderKey, value: normalized);
   }
 
   // Backward-compatible Gemini helpers used by Live Voice and older tests.

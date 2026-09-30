@@ -1,0 +1,132 @@
+"""Persistence boundary for ordered assistant task batches.
+
+Step 1B intentionally does only this:
+    parsed intents -> one batch document -> Task 1 active, remaining tasks pending
+
+It does NOT create assistant drafts, ask follow-up questions, execute tasks, or
+advance to Task 2. Those behaviors are added in later checkpoints.
+"""
+
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+
+from src.modules.assistant.batch_parser import (
+    BATCH_CREATE_ACTIONS,
+    MAX_BATCH_TASKS,
+)
+from src.modules.assistant.batches.repository import insert_batch
+
+
+BATCH_TTL = timedelta(hours=1)
+
+
+class AssistantBatchError(Exception):
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _validated_intents(parsed):
+    if not isinstance(parsed, dict):
+        raise AssistantBatchError("Parsed batch result is required.")
+
+    intents = parsed.get("intents")
+    if not isinstance(intents, list) or not intents:
+        raise AssistantBatchError("At least one parsed task is required.")
+
+    if len(intents) > MAX_BATCH_TASKS:
+        raise AssistantBatchError(
+            f"A maximum of {MAX_BATCH_TASKS} tasks can be stored in one batch."
+        )
+
+    validated = []
+    for index, intent in enumerate(intents):
+        if not isinstance(intent, dict):
+            raise AssistantBatchError(
+                f"Task {index + 1} has an invalid intent structure."
+            )
+
+        action = intent.get("action")
+        if action not in BATCH_CREATE_ACTIONS:
+            raise AssistantBatchError(
+                f"Task {index + 1} is not a supported create action."
+            )
+
+        arguments = intent.get("arguments")
+        task = (arguments or {}).get("task") if isinstance(arguments, dict) else None
+        if not isinstance(task, dict):
+            raise AssistantBatchError(
+                f"Task {index + 1} is missing its task payload."
+            )
+
+        validated.append(deepcopy(intent))
+
+    return validated
+
+
+def _public_item(item):
+    return {
+        "index": item["index"],
+        "task_number": item["task_number"],
+        "status": item["status"],
+        "draft_id": item.get("draft_id"),
+        "intent": deepcopy(item["intent"]),
+    }
+
+
+def create_task_batch(parsed, source_message=None):
+    """Persist ordered parsed intents and activate only Task 1."""
+
+    intents = _validated_intents(parsed)
+
+    if source_message is not None and not isinstance(source_message, str):
+        raise AssistantBatchError("source_message must be a string when provided.")
+
+    now = _utc_now()
+    items = []
+
+    for index, intent in enumerate(intents):
+        items.append(
+            {
+                "index": index,
+                "task_number": index + 1,
+                "status": "active" if index == 0 else "pending",
+                "draft_id": None,
+                "intent": intent,
+            }
+        )
+
+    document = {
+        "status": "in_progress",
+        "current_index": 0,
+        "total_tasks": len(items),
+        "items": items,
+        "source_message": source_message.strip() if source_message else None,
+        "provider": parsed.get("provider", ""),
+        "model": parsed.get("model", ""),
+        "timezone": parsed.get("timezone", "UTC"),
+        "fallback_used": bool(parsed.get("fallback_used", False)),
+        "attempted_providers": list(parsed.get("attempted_providers") or []),
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + BATCH_TTL,
+    }
+
+    batch_id = insert_batch(document)
+    document["_id"] = batch_id
+
+    active_item = items[0]
+    return {
+        "batch_id": str(batch_id),
+        "status": document["status"],
+        "current_index": document["current_index"],
+        "current_task_number": active_item["task_number"],
+        "total_tasks": document["total_tasks"],
+        "active_item": _public_item(active_item),
+        "items": [_public_item(item) for item in items],
+    }

@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/network/api_exception.dart';
@@ -12,6 +15,7 @@ import '../../home/application/home_providers.dart';
 import '../../tasks/presentation/new_task_screen.dart';
 import '../application/assistant_providers.dart';
 import '../data/assistant_repository.dart';
+import '../data/assistant_batch_session_store.dart';
 import '../domain/assistant_intent.dart';
 import '../domain/assistant_message.dart';
 import 'voice_mode_screen.dart';
@@ -25,6 +29,7 @@ class AssistantScreen extends ConsumerStatefulWidget {
 
 class _AssistantScreenState extends ConsumerState<AssistantScreen> {
   final _messageController = TextEditingController();
+  final _messageFocusNode = FocusNode();
   final _scrollController = ScrollController();
   final List<AssistantMessage> _messages = [];
 
@@ -33,6 +38,14 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
   String? _activeDraftId;
   AssistantCommandPreview? _pendingCommand;
   String? _selectedMatchId;
+
+  // Ordered multi-task creation state.
+  String? _activeBatchId;
+  int? _activeBatchTaskNumber;
+  int? _activeBatchTotalTasks;
+  ActiveTaskControlIntent? _pendingTaskControlIntent;
+  final AssistantBatchSessionStore _batchSessionStore =
+      const AssistantBatchSessionStore();
 
   // Quick-reply chips for the question currently being asked.
   List<String> _suggestions = const [];
@@ -51,18 +64,151 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
   // until they explicitly tap it again.
   bool _voiceModeActive = false;
 
+  // Android speech recognition is session-based.
+  // Keep restarting sessions while the user has not
+  // manually turned dictation off.
+  Timer? _speechRestartTimer;
+
+  bool _speechRestarting = false;
+
   // Text that existed before the current dictation started.
   // Partial speech results are appended to this instead of
   // repeatedly duplicating recognized words.
   String _speechPrefix = '';
   String _speechCommitted = '';
 
+  // Current Android recognition hypothesis.
+  //
+  // IMPORTANT:
+  // This value is NOT permanently committed on every
+  // partial result because Android frequently revises or
+  // completely resets partial speech hypotheses.
+  String _speechLive = '';
+
+  // Used to prevent rapid restart loops when Android opens a
+  // recognition session and immediately closes it.
+  bool _speechHadResultThisSession = false;
+  int _speechEmptyRestartCount = 0;
+
+  @override
+  void initState() {
+    super.initState();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _recoverPersistedTaskBatch();
+    });
+  }
+
+  Future<void> _rememberActiveBatch(String batchId) async {
+    try {
+      await _batchSessionStore.saveActiveBatchId(batchId);
+    } catch (error) {
+      debugPrint('[BATCH] Could not persist active batch id: $error');
+    }
+  }
+
+  Future<void> _forgetActiveBatch() async {
+    try {
+      await _batchSessionStore.clearActiveBatchId();
+    } catch (error) {
+      debugPrint('[BATCH] Could not clear persisted batch id: $error');
+    }
+  }
+
+  Future<void> _recoverPersistedTaskBatch() async {
+    String? batchId;
+
+    try {
+      batchId = await _batchSessionStore.loadActiveBatchId();
+    } catch (error) {
+      debugPrint('[BATCH] Could not read persisted batch id: $error');
+      return;
+    }
+
+    if (!mounted || batchId == null || batchId.isEmpty) {
+      return;
+    }
+
+    // Claim the recovered batch locally before the network request so a
+    // temporary backend outage cannot accidentally start a second batch.
+    setState(() {
+      _activeBatchId = batchId;
+      _sending = true;
+    });
+
+    try {
+      final active = await ref
+          .read(assistantRepositoryProvider)
+          .getActiveTaskBatch(batchId);
+
+      if (!mounted) return;
+
+      _applyBatchDraft(
+        batchId: active.batchId,
+        currentTaskNumber: active.currentTaskNumber,
+        totalTasks: active.totalTasks,
+        preview: active.activeDraft,
+      );
+    } on ApiException catch (error) {
+      if (!mounted) return;
+
+      // The stored id can outlive the server-side batch TTL or a batch that
+      // completed immediately before the app was terminated. In those cases
+      // remove only the stale local pointer.
+      if (error.statusCode == 404 || error.statusCode == 409) {
+        await _forgetActiveBatch();
+        if (!mounted) return;
+        setState(() {
+          _activeBatchId = null;
+          _activeBatchTaskNumber = null;
+          _activeBatchTotalTasks = null;
+          _activeDraftId = null;
+          _pendingCommand = null;
+          _selectedMatchId = null;
+          _suggestions = const [];
+        });
+        return;
+      }
+
+      setState(() {
+        _messages.add(
+          const AssistantMessage(
+            text:
+                'Your unfinished task batch is still saved, but it could '
+                'not be restored right now. Reopen Assistant when the '
+                'backend is available.',
+            fromUser: false,
+          ),
+        );
+      });
+    } catch (error) {
+      if (!mounted) return;
+      debugPrint('[BATCH] Recovery failed: $error');
+      setState(() {
+        _messages.add(
+          const AssistantMessage(
+            text:
+                'Your unfinished task batch is still saved, but it could '
+                'not be restored right now. Reopen Assistant and try again.',
+            fromUser: false,
+          ),
+        );
+      });
+    } finally {
+      _finishSending();
+    }
+  }
+
   @override
   void dispose() {
     _activeCancelToken?.cancel('Assistant screen closed.');
 
+    _speechRestartTimer?.cancel();
+    _speechRestartTimer = null;
+
     _speechToText.cancel();
     _messageController.dispose();
+    _messageFocusNode.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -98,6 +244,12 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
           // They are not application failures.
           //
           if (code == 'error_speech_timeout' || code == 'error_no_match') {
+            _commitLiveSpeech();
+
+            if (_voiceModeActive && !_sending) {
+              _scheduleSpeechRestart(const Duration(milliseconds: 700));
+            }
+
             return;
           }
 
@@ -142,17 +294,102 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
       return;
     }
 
-    final listening = status == stt.SpeechToText.listeningStatus;
+    final normalized = status.trim().toLowerCase();
+
+    final listening =
+        status == stt.SpeechToText.listeningStatus || normalized == 'listening';
 
     setState(() {
       _isListening = listening;
     });
 
-    // Android speech recognition can automatically
-    // finish a listening session after silence.
-    //
-    // If the user still has voice mode enabled,
-    // immediately start another recognition session.
+    debugPrint(
+      '[SPEECH] status=$status '
+      'active=$_voiceModeActive '
+      'pluginListening=${_speechToText.isListening}',
+    );
+
+    if (!_voiceModeActive || _sending || _speechRestarting) {
+      return;
+    }
+
+    final sessionEnded =
+        normalized == 'done' ||
+        normalized == 'notlistening' ||
+        normalized == 'not_listening';
+
+    if (!sessionEnded) {
+      return;
+    }
+
+    // Preserve the final partial result from this Android
+    // recognition session before starting another one.
+    _commitLiveSpeech();
+
+    int restartDelay;
+
+    if (_speechHadResultThisSession) {
+      // Normal session transition.
+      restartDelay = 550;
+      _speechEmptyRestartCount = 0;
+    } else {
+      // Android sometimes opens a recognizer and immediately
+      // closes it. Gradually increase the delay instead of
+      // creating a fast restart loop.
+      _speechEmptyRestartCount++;
+
+      restartDelay = 700 + (_speechEmptyRestartCount * 350);
+
+      if (restartDelay > 1800) {
+        restartDelay = 1800;
+      }
+    }
+
+    _scheduleSpeechRestart(Duration(milliseconds: restartDelay));
+  }
+
+  void _scheduleSpeechRestart([
+    Duration delay = const Duration(milliseconds: 550),
+  ]) {
+    if (!_voiceModeActive || _sending || _speechRestarting) {
+      return;
+    }
+
+    _speechRestartTimer?.cancel();
+
+    _speechRestartTimer = Timer(delay, () {
+      unawaited(_restartSpeechRecognition());
+    });
+  }
+
+  Future<void> _restartSpeechRecognition() async {
+    if (!mounted || !_voiceModeActive || _sending || _speechRestarting) {
+      return;
+    }
+
+    _speechRestarting = true;
+
+    try {
+      debugPrint('[SPEECH] restarting recognizer...');
+
+      if (_speechToText.isListening) {
+        try {
+          await _speechToText.stop();
+        } catch (_) {}
+      }
+
+      // Give Android's SpeechRecognizer enough time to fully
+      // release the previous native recognition session.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      if (!mounted || !_voiceModeActive || _sending) {
+        return;
+      }
+
+      await _startListeningSession();
+    } finally {
+      _speechRestarting = false;
+    }
   }
 
   void _onSpeechResult(SpeechRecognitionResult result) {
@@ -164,36 +401,135 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
       return;
     }
 
-    // =====================================================
-    // IMPORTANT
-    // =====================================================
-    //
-    // Android speech recognition can revise or reset its
-    // partial hypothesis while the user is still speaking.
-    //
-    // Therefore we merge EVERY speech result into our
-    // persistent transcript instead of replacing the
-    // TextField with recognizedWords.
+    _speechHadResultThisSession = true;
+
+    _speechEmptyRestartCount = 0;
+
+    debugPrint(
+      '[SPEECH] result="$spoken" '
+      'final=${result.finalResult}',
+    );
+
+    // ======================================================
+    // ANDROID PARTIAL-RESULT RESET DETECTION
+    // ======================================================
     //
     // Example:
     //
-    // existing:
-    //   "hello this is the best"
+    // previous live result:
+    // "create gym task from september twenty ninth"
     //
-    // next result:
-    //   "this is the best application"
+    // Android suddenly returns:
+    // "thirty"
     //
-    // result:
-    //   "hello this is the best application"
+    // That is not a correction of the previous sentence.
+    // Android has internally started another phrase.
     //
-    // Earlier speech can never disappear.
+    // Commit the old phrase first, then start a new live
+    // hypothesis instead of appending every partial result.
+    //
+    if (_looksLikeNewSpeechSegment(_speechLive, spoken)) {
+      debugPrint('[SPEECH] partial hypothesis reset detected');
 
-    _speechCommitted = _mergeSpeechText(_speechCommitted, spoken);
+      _commitLiveSpeech();
+    }
 
+    // Within one Android recognition segment the latest
+    // hypothesis replaces the previous hypothesis.
+    //
+    // This allows Android to correct its own words without
+    // duplicating all intermediate partial results.
+    _speechLive = spoken;
+
+    _renderSpeechTranscript();
+
+    if (result.finalResult) {
+      _commitLiveSpeech();
+
+      if (_voiceModeActive && !_sending) {
+        _scheduleSpeechRestart(const Duration(milliseconds: 600));
+      }
+    }
+  }
+
+  bool _looksLikeNewSpeechSegment(String previous, String incoming) {
+    final left = previous.trim().toLowerCase();
+
+    final right = incoming.trim().toLowerCase();
+
+    if (left.isEmpty || right.isEmpty) {
+      return false;
+    }
+
+    // Normal hypothesis expansion.
+    if (right.startsWith(left)) {
+      return false;
+    }
+
+    // Normal hypothesis shortening/revision.
+    if (left.startsWith(right)) {
+      return false;
+    }
+
+    final leftWords = left.split(RegExp(r'\s+'));
+
+    final rightWords = right.split(RegExp(r'\s+'));
+
+    // Very short existing hypotheses are too unstable to
+    // confidently call this an Android segmentation reset.
+    if (leftWords.length < 6) {
+      return false;
+    }
+
+    // Check whether the new phrase continues from the end of
+    // the previous phrase.
+    final maxOverlap = leftWords.length < rightWords.length
+        ? leftWords.length
+        : rightWords.length;
+
+    for (
+      var overlap = maxOverlap > 5 ? 5 : maxOverlap;
+      overlap >= 1;
+      overlap--
+    ) {
+      final leftTail = leftWords.sublist(leftWords.length - overlap).join(' ');
+
+      final rightHead = rightWords.sublist(0, overlap).join(' ');
+
+      if (leftTail == rightHead) {
+        return false;
+      }
+    }
+
+    // The characteristic Android reset is a long hypothesis
+    // suddenly becoming a much shorter, unrelated phrase.
+    final muchShorter =
+        rightWords.length <= 5 || rightWords.length * 2 <= leftWords.length;
+
+    return muchShorter;
+  }
+
+  void _commitLiveSpeech() {
+    final live = _speechLive.trim();
+
+    if (live.isEmpty) {
+      return;
+    }
+
+    _speechCommitted = _mergeSpeechText(_speechCommitted, live);
+
+    _speechLive = '';
+
+    _renderSpeechTranscript();
+  }
+
+  void _renderSpeechTranscript() {
     final parts = <String>[
       if (_speechPrefix.trim().isNotEmpty) _speechPrefix.trim(),
 
       if (_speechCommitted.trim().isNotEmpty) _speechCommitted.trim(),
+
+      if (_speechLive.trim().isNotEmpty) _speechLive.trim(),
     ];
 
     final combined = parts.join(' ');
@@ -270,7 +606,13 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
       return;
     }
 
-    // Preserve everything already dictated.
+    _speechRestartTimer?.cancel();
+    _speechRestartTimer = null;
+
+    // A new Android recognition session gets a new temporary
+    // hypothesis. Previously committed speech remains intact.
+    _speechLive = '';
+    _speechHadResultThisSession = false;
 
     try {
       await _speechToText.listen(
@@ -285,11 +627,9 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
 
           autoPunctuation: true,
 
-          // Android may still stop earlier.
-          // We automatically restart when it does.
-          listenFor: const Duration(minutes: 5),
+          listenFor: const Duration(minutes: 10),
 
-          pauseFor: const Duration(seconds: 10),
+          pauseFor: const Duration(seconds: 20),
         ),
       );
 
@@ -300,7 +640,15 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
       setState(() {
         _isListening = _speechToText.isListening;
       });
-    } catch (_) {}
+    } catch (error, stackTrace) {
+      debugPrint('[SPEECH] listen failed: $error');
+
+      debugPrint('$stackTrace');
+
+      if (_voiceModeActive && !_sending) {
+        _scheduleSpeechRestart(const Duration(milliseconds: 900));
+      }
+    }
   }
 
   Future<void> _toggleVoiceInput() async {
@@ -313,7 +661,12 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
     // =====================================================
 
     if (_voiceModeActive) {
+      _commitLiveSpeech();
+
       _voiceModeActive = false;
+
+      _speechRestartTimer?.cancel();
+      _speechRestartTimer = null;
 
       await _speechToText.stop();
 
@@ -358,6 +711,10 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
     _speechPrefix = _messageController.text.trim();
 
     _speechCommitted = '';
+    _speechLive = '';
+
+    _speechHadResultThisSession = false;
+    _speechEmptyRestartCount = 0;
 
     setState(() {
       _voiceModeActive = true;
@@ -367,7 +724,12 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
   }
 
   Future<void> _send() async {
+    _commitLiveSpeech();
+
     _voiceModeActive = false;
+
+    _speechRestartTimer?.cancel();
+    _speechRestartTimer = null;
 
     if (_speechToText.isListening || _isListening) {
       await _speechToText.stop();
@@ -382,22 +744,21 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
     final message = _messageController.text.trim();
     if (message.isEmpty || _sending) return;
 
-    final normalized = message.toLowerCase();
-    if (_activeDraftId != null &&
-        const {
-          'cancel',
-          'never mind',
-          'nevermind',
-          'stop',
-        }.contains(normalized)) {
-      _messageController.clear();
-      _cancelCommand();
-      return;
-    }
+    final allowEdit = _activeBatchId == null && _activeDraftId == null;
+
+    final taskControlIntent = (_activeBatchId != null || _activeDraftId != null)
+        ? detectActiveTaskControlIntent(message)
+        : ActiveTaskControlIntent.none;
+    final preserveTaskFlowUi =
+        taskControlIntent != ActiveTaskControlIntent.none;
 
     setState(() {
-      _suggestions = const [];
-      _messages.add(AssistantMessage(text: message, fromUser: true));
+      if (!preserveTaskFlowUi) {
+        _suggestions = const [];
+      }
+      _messages.add(
+        AssistantMessage(text: message, fromUser: true, allowEdit: allowEdit),
+      );
       _messageController.clear();
       _activeCancelToken = CancelToken();
       _sending = true;
@@ -414,7 +775,9 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
     // start a fresh command instead of being interpreted
     // as the answer to the current draft question.
     final interruptDraft =
-        _activeDraftId != null && shouldInterruptTaskDraft(message);
+        _activeBatchId == null &&
+        _activeDraftId != null &&
+        shouldInterruptTaskDraft(message);
 
     if (interruptDraft) {
       setState(() {
@@ -425,7 +788,17 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
       });
     }
 
-    if (_activeDraftId != null || looksLikeTaskAction(message)) {
+    if (taskControlIntent != ActiveTaskControlIntent.none) {
+      _presentTaskControlConfirmation(taskControlIntent);
+      _finishSending();
+      return;
+    }
+
+    if (_activeBatchId != null) {
+      await _continueTaskBatch(message);
+    } else if (_activeDraftId == null && looksLikeCreateTaskAction(message)) {
+      await _startTaskBatch(message);
+    } else if (_activeDraftId != null || looksLikeTaskAction(message)) {
       await _previewTaskCommand(message);
     } else {
       await _sendChat(message);
@@ -443,7 +816,10 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
           AssistantMessage(
             text: result.reply,
             fromUser: false,
+            provider: result.provider,
             model: result.model,
+            fallbackUsed: result.fallbackUsed,
+            retryText: message,
           ),
         );
       });
@@ -454,6 +830,291 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
       _addError(error.message);
     } catch (_) {
       _addError('Could not reach the assistant.');
+    } finally {
+      _finishSending();
+    }
+  }
+
+  void _applyBatchDraft({
+    required String batchId,
+    required int currentTaskNumber,
+    required int totalTasks,
+    required AssistantCommandPreview preview,
+    String? provider,
+    String? model,
+    bool fallbackUsed = false,
+  }) {
+    _activeBatchId = batchId;
+    _activeBatchTaskNumber = currentTaskNumber;
+    _activeBatchTotalTasks = totalTasks;
+    _activeDraftId = preview.draftId;
+
+    final position = 'Task $currentTaskNumber of $totalTasks';
+
+    if (preview.needsInput) {
+      setState(() {
+        _pendingCommand = null;
+        _selectedMatchId = null;
+        _suggestions = preview.suggestions;
+        _messages.add(
+          AssistantMessage(
+            text:
+                '$position\n\n${preview.question ?? 'I need a little more information.'}',
+            fromUser: false,
+            provider: provider,
+            model: (model ?? '').isNotEmpty ? model : preview.model,
+            fallbackUsed: fallbackUsed,
+          ),
+        );
+      });
+      _scrollToBottom();
+      return;
+    }
+
+    setState(() {
+      _pendingCommand = preview;
+      _selectedMatchId = null;
+      _suggestions = const [];
+      _messages.add(
+        AssistantMessage(
+          text: '$position is ready for review.',
+          fromUser: false,
+          provider: provider,
+          model: (model ?? '').isNotEmpty ? model : preview.model,
+          fallbackUsed: fallbackUsed,
+        ),
+      );
+    });
+    _scrollToBottom();
+  }
+
+  Future<void> _startTaskBatch(String message) async {
+    try {
+      final batch = await ref
+          .read(assistantRepositoryProvider)
+          .startTaskBatch(message, cancelToken: _activeCancelToken);
+
+      await _rememberActiveBatch(batch.batchId);
+
+      if (!mounted) return;
+
+      _applyBatchDraft(
+        batchId: batch.batchId,
+        currentTaskNumber: batch.currentTaskNumber,
+        totalTasks: batch.totalTasks,
+        preview: batch.activeDraft,
+        provider: batch.provider,
+        model: batch.model,
+        fallbackUsed: batch.fallbackUsed,
+      );
+    } on DioException catch (error) {
+      if (CancelToken.isCancel(error)) return;
+      rethrow;
+    } on ApiException catch (error) {
+      _addError(error.message);
+    } catch (_) {
+      _addError('Could not start that task request.');
+    } finally {
+      _finishSending();
+    }
+  }
+
+  Future<void> _continueTaskBatch(String message) async {
+    final batchId = _activeBatchId;
+    if (batchId == null || batchId.isEmpty) {
+      _addError('The active task batch could not be recovered.');
+      _finishSending();
+      return;
+    }
+
+    try {
+      final active = await ref
+          .read(assistantRepositoryProvider)
+          .continueTaskBatch(
+            batchId: batchId,
+            message: message,
+            cancelToken: _activeCancelToken,
+          );
+
+      if (!mounted) return;
+
+      _applyBatchDraft(
+        batchId: active.batchId,
+        currentTaskNumber: active.currentTaskNumber,
+        totalTasks: active.totalTasks,
+        preview: active.activeDraft,
+      );
+    } on DioException catch (error) {
+      if (CancelToken.isCancel(error)) return;
+      rethrow;
+    } on ApiException catch (error) {
+      _addError(error.message);
+    } catch (_) {
+      _addError('Could not continue that task.');
+    } finally {
+      _finishSending();
+    }
+  }
+
+  Future<void> _handleBatchResolution(
+    AssistantTaskBatchResolutionResult resolution, {
+    required AssistantCommandPreview resolvedPreview,
+    required bool confirmed,
+  }) async {
+    if (!mounted) return;
+
+    final resolvedNumber = resolution.resolvedTaskNumber;
+    final totalTasks = resolution.totalTasks;
+
+    setState(() {
+      _pendingCommand = null;
+      _selectedMatchId = null;
+      _suggestions = const [];
+      _activeDraftId = null;
+      _messages.add(
+        AssistantMessage(
+          text: confirmed
+              ? '✓ Saved Task $resolvedNumber of $totalTasks\n'
+                    '${resolvedPreview.summary}'
+              : '→ Skipped Task $resolvedNumber of $totalTasks\n'
+                    'No changes were made for this task.',
+          fromUser: false,
+          model: resolvedPreview.model,
+        ),
+      );
+    });
+
+    if (resolution.allDone) {
+      await _forgetActiveBatch();
+      if (!mounted) return;
+
+      setState(() {
+        _activeBatchId = null;
+        _activeBatchTaskNumber = null;
+        _activeBatchTotalTasks = null;
+        _activeDraftId = null;
+        _pendingCommand = null;
+        _selectedMatchId = null;
+        _suggestions = const [];
+        _messages.add(
+          AssistantMessage(
+            text:
+                '✓ Batch complete\n'
+                '$totalTasks of $totalTasks task requests reviewed.',
+            fromUser: false,
+          ),
+        );
+      });
+      _scrollToBottom();
+      return;
+    }
+
+    await _rememberActiveBatch(resolution.batchId);
+    if (!mounted) return;
+
+    var nextTask = resolution.nextTask;
+
+    // The backend normally returns the already-prepared next task. If that
+    // preparation failed after the previous task was safely resolved, recover
+    // through the idempotent /active endpoint instead of misreporting the
+    // confirmed task as failed.
+    if (nextTask == null) {
+      try {
+        nextTask = await ref
+            .read(assistantRepositoryProvider)
+            .getActiveTaskBatch(resolution.batchId);
+      } on ApiException catch (error) {
+        if (!mounted) return;
+        _activeBatchId = resolution.batchId;
+        _addError(
+          'Task $resolvedNumber was ${confirmed ? 'saved' : 'skipped'}, '
+          'but the next task could not be loaded: ${error.message}',
+        );
+        return;
+      } catch (_) {
+        if (!mounted) return;
+        _activeBatchId = resolution.batchId;
+        _addError(
+          'Task $resolvedNumber was ${confirmed ? 'saved' : 'skipped'}, '
+          'but the next task could not be loaded.',
+        );
+        return;
+      }
+    }
+
+    if (!mounted) return;
+
+    _applyBatchDraft(
+      batchId: nextTask.batchId,
+      currentTaskNumber: nextTask.currentTaskNumber,
+      totalTasks: nextTask.totalTasks,
+      preview: nextTask.activeDraft,
+    );
+  }
+
+  Future<void> _confirmBatchCommand({
+    String? duplicateDecision,
+    String? candidateId,
+  }) async {
+    final batchId = _activeBatchId;
+    final preview = _pendingCommand;
+
+    if (batchId == null || batchId.isEmpty || preview == null || _sending) {
+      return;
+    }
+
+    setState(() => _sending = true);
+
+    try {
+      final resolution = await ref
+          .read(assistantRepositoryProvider)
+          .confirmTaskBatch(
+            batchId: batchId,
+            draftId: preview.draftId,
+            duplicateDecision: duplicateDecision,
+            candidateId: candidateId,
+          );
+
+      _refreshTaskScreens();
+
+      await _handleBatchResolution(
+        resolution,
+        resolvedPreview: preview,
+        confirmed: true,
+      );
+    } on ApiException catch (error) {
+      _addError(error.message);
+    } catch (_) {
+      _addError('Could not confirm that batch task.');
+    } finally {
+      _finishSending();
+    }
+  }
+
+  Future<void> _cancelBatchCommand() async {
+    final batchId = _activeBatchId;
+    final preview = _pendingCommand;
+
+    if (batchId == null || batchId.isEmpty || preview == null || _sending) {
+      return;
+    }
+
+    setState(() => _sending = true);
+
+    try {
+      final resolution = await ref
+          .read(assistantRepositoryProvider)
+          .cancelTaskBatch(batchId: batchId, draftId: preview.draftId);
+
+      await _handleBatchResolution(
+        resolution,
+        resolvedPreview: preview,
+        confirmed: false,
+      );
+    } on ApiException catch (error) {
+      _addError(error.message);
+    } catch (_) {
+      _addError('Could not skip that batch task.');
     } finally {
       _finishSending();
     }
@@ -746,6 +1407,387 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
     });
   }
 
+  Future<void> _copyMessageText(String text) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Copied to clipboard.'),
+        duration: Duration(milliseconds: 1200),
+      ),
+    );
+  }
+
+  Future<void> _editSentMessage(int index) async {
+    if (_sending || index < 0 || index >= _messages.length) return;
+
+    final message = _messages[index];
+    if (!message.fromUser || !message.allowEdit) return;
+
+    // Editing an original request creates a new branch locally. If the user
+    // has already progressed beyond Task 1, previous confirmed task changes
+    // may already exist in MongoDB and cannot be rolled back automatically.
+    final progressedBatch =
+        _activeBatchId != null && (_activeBatchTaskNumber ?? 1) > 1;
+
+    if (progressedBatch) {
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Edit this request?'),
+          content: const Text(
+            'Some earlier tasks in this batch may already have been saved. '
+            'Editing will start a new request and will not undo saved tasks.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Edit anyway'),
+            ),
+          ],
+        ),
+      );
+
+      if (proceed != true || !mounted) return;
+    }
+
+    if (_activeBatchId != null) {
+      await _forgetActiveBatch();
+      if (!mounted) return;
+    }
+
+    setState(() {
+      // Remove the old branch from the visible conversation. Server-side
+      // drafts/batches are TTL-backed and are no longer referenced locally.
+      if (index + 1 < _messages.length) {
+        _messages.removeRange(index + 1, _messages.length);
+      }
+      _messages.removeAt(index);
+
+      _activeBatchId = null;
+      _activeBatchTaskNumber = null;
+      _activeBatchTotalTasks = null;
+      _activeDraftId = null;
+      _pendingCommand = null;
+      _selectedMatchId = null;
+      _suggestions = const [];
+
+      _messageController.value = TextEditingValue(
+        text: message.text,
+        selection: TextSelection.collapsed(offset: message.text.length),
+      );
+    });
+
+    _messageFocusNode.requestFocus();
+  }
+
+  Future<void> _retryAssistantMessage(String text) async {
+    if (_sending) return;
+
+    if (_activeBatchId != null || _activeDraftId != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Finish or cancel the current task flow before trying an older '
+            'AI reply again.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    _messageController.value = TextEditingValue(
+      text: text,
+      selection: TextSelection.collapsed(offset: text.length),
+    );
+    _messageFocusNode.requestFocus();
+    await _send();
+  }
+
+  void _presentTaskControlConfirmation(ActiveTaskControlIntent intent) {
+    var effectiveIntent = intent;
+    String prompt;
+
+    // Skip-for-now requires another unresolved task to move to. For legacy
+    // non-batch drafts, offer a safe choice instead of silently converting
+    // "skip" into "discard".
+    if (intent == ActiveTaskControlIntent.skipCurrent &&
+        _activeBatchId == null) {
+      effectiveIntent = ActiveTaskControlIntent.ambiguousStop;
+      prompt = 'This task is not part of a multi-task batch. What would you like to do?';
+    } else if (intent == ActiveTaskControlIntent.discardRemaining &&
+        _activeBatchId == null) {
+      effectiveIntent = ActiveTaskControlIntent.discardCurrent;
+      prompt = 'Do you want to discard this task?';
+    } else {
+      prompt = switch (intent) {
+        ActiveTaskControlIntent.discardCurrent =>
+          'Do you want to discard this task?',
+        ActiveTaskControlIntent.discardRemaining =>
+          'Do you want to discard all remaining tasks?',
+        ActiveTaskControlIntent.skipCurrent => 'Do you want to skip this task?',
+        ActiveTaskControlIntent.startNewTask =>
+          _activeBatchId != null
+              ? 'You still have unfinished tasks. Do you want to discard all remaining tasks and start a new task?'
+              : 'Do you want to discard this task and start a new task?',
+        ActiveTaskControlIntent.ambiguousStop => 'What would you like to do?',
+        ActiveTaskControlIntent.none => '',
+      };
+    }
+
+    if (prompt.isEmpty || !mounted) return;
+
+    setState(() {
+      _pendingTaskControlIntent = effectiveIntent;
+      _messages.add(AssistantMessage(text: prompt, fromUser: false));
+    });
+    _scrollToBottom();
+  }
+
+  void _continueTaskAfterControlPrompt() {
+    if (_sending) return;
+
+    final current = _activeBatchTaskNumber;
+    final total = _activeBatchTotalTasks;
+
+    setState(() {
+      _pendingTaskControlIntent = null;
+      _messages.add(
+        AssistantMessage(
+          text: current != null && total != null
+              ? 'Continuing Task $current of $total.'
+              : 'Continuing the current task.',
+          fromUser: false,
+        ),
+      );
+    });
+    _scrollToBottom();
+  }
+
+  Future<void> _handleTaskControlResolution(
+    AssistantTaskBatchResolutionResult resolution, {
+    required String message,
+  }) async {
+    if (!mounted) return;
+
+    setState(() {
+      _pendingTaskControlIntent = null;
+      _pendingCommand = null;
+      _selectedMatchId = null;
+      _suggestions = const [];
+      _activeDraftId = null;
+      _messages.add(AssistantMessage(text: message, fromUser: false));
+    });
+
+    if (resolution.allDone) {
+      await _forgetActiveBatch();
+      if (!mounted) return;
+
+      setState(() {
+        _activeBatchId = null;
+        _activeBatchTaskNumber = null;
+        _activeBatchTotalTasks = null;
+        _activeDraftId = null;
+        _pendingCommand = null;
+        _selectedMatchId = null;
+        _suggestions = const [];
+        _messages.add(
+          const AssistantMessage(
+            text: 'The task batch is complete.',
+            fromUser: false,
+          ),
+        );
+      });
+      _scrollToBottom();
+      return;
+    }
+
+    await _rememberActiveBatch(resolution.batchId);
+    if (!mounted) return;
+
+    var nextTask = resolution.nextTask;
+    if (nextTask == null) {
+      try {
+        nextTask = await ref
+            .read(assistantRepositoryProvider)
+            .getActiveTaskBatch(resolution.batchId);
+      } on ApiException catch (error) {
+        _activeBatchId = resolution.batchId;
+        _addError(
+          'The current task was updated, but the next task could not be loaded: '
+          '${error.message}',
+        );
+        return;
+      } catch (_) {
+        _activeBatchId = resolution.batchId;
+        _addError(
+          'The current task was updated, but the next task could not be loaded.',
+        );
+        return;
+      }
+    }
+
+    if (!mounted) return;
+
+    _applyBatchDraft(
+      batchId: nextTask.batchId,
+      currentTaskNumber: nextTask.currentTaskNumber,
+      totalTasks: nextTask.totalTasks,
+      preview: nextTask.activeDraft,
+    );
+  }
+
+  Future<void> _confirmSkipCurrentTask() async {
+    final batchId = _activeBatchId;
+    final draftId = _activeDraftId;
+    if (_sending || batchId == null || draftId == null) return;
+
+    final totalTasks = _activeBatchTotalTasks ?? 1;
+    final isOnlyTask = totalTasks <= 1;
+
+    setState(() => _sending = true);
+    try {
+      // "Skip for now" requires another unfinished task to move to.
+      //
+      // For a one-task batch, use the existing batch-cancel endpoint instead:
+      // it resolves the only item as skipped, creates nothing, and completes
+      // the batch cleanly.
+      final resolution = isOnlyTask
+          ? await ref
+                .read(assistantRepositoryProvider)
+                .cancelTaskBatch(batchId: batchId, draftId: draftId)
+          : await ref
+                .read(assistantRepositoryProvider)
+                .deferTaskBatch(batchId: batchId, draftId: draftId);
+
+      await _handleTaskControlResolution(
+        resolution,
+        message: isOnlyTask
+            ? 'Skipped Task ${resolution.resolvedTaskNumber}. No task was created from it.'
+            : 'Skipped Task ${resolution.resolvedTaskNumber} for now. I will return to it after the other unfinished tasks.',
+      );
+    } on ApiException catch (error) {
+      _addError(error.message);
+    } catch (_) {
+      _addError(
+        isOnlyTask
+            ? 'Could not skip that task.'
+            : 'Could not skip that task for now.',
+      );
+    } finally {
+      _finishSending();
+    }
+  }
+
+  Future<void> _confirmDiscardCurrentTask() async {
+    final batchId = _activeBatchId;
+    final draftId = _activeDraftId;
+    if (_sending || draftId == null) return;
+
+    // Legacy single-command drafts are local-only flows. They still require
+    // confirmation, but do not have a server-owned batch to advance.
+    if (batchId == null) {
+      setState(() => _pendingTaskControlIntent = null);
+      _cancelCommand();
+      return;
+    }
+
+    setState(() => _sending = true);
+    try {
+      final resolution = await ref
+          .read(assistantRepositoryProvider)
+          .cancelTaskBatch(batchId: batchId, draftId: draftId);
+
+      await _handleTaskControlResolution(
+        resolution,
+        message:
+            'Discarded Task ${resolution.resolvedTaskNumber}. No task was created from it.',
+      );
+    } on ApiException catch (error) {
+      _addError(error.message);
+    } catch (_) {
+      _addError('Could not discard that task.');
+    } finally {
+      _finishSending();
+    }
+  }
+
+  Future<void> _confirmDiscardRemainingTasks({
+    bool startNewTask = false,
+  }) async {
+    final batchId = _activeBatchId;
+    final draftId = _activeDraftId;
+    if (_sending || draftId == null) return;
+
+    if (batchId == null) {
+      setState(() => _pendingTaskControlIntent = null);
+      _cancelCommand();
+      if (startNewTask && mounted) {
+        setState(() {
+          _messages.add(
+            const AssistantMessage(
+              text: 'What task would you like to create?',
+              fromUser: false,
+            ),
+          );
+        });
+      }
+      return;
+    }
+
+    final current = _activeBatchTaskNumber ?? 1;
+    final total = _activeBatchTotalTasks ?? current;
+
+    setState(() => _sending = true);
+    try {
+      await ref
+          .read(assistantRepositoryProvider)
+          .abortTaskBatch(batchId: batchId, draftId: draftId);
+
+      await _forgetActiveBatch();
+      if (!mounted) return;
+
+      setState(() {
+        _pendingTaskControlIntent = null;
+        _activeBatchId = null;
+        _activeBatchTaskNumber = null;
+        _activeBatchTotalTasks = null;
+        _activeDraftId = null;
+        _pendingCommand = null;
+        _selectedMatchId = null;
+        _suggestions = const [];
+        _messages.add(
+          AssistantMessage(
+            text: current <= 1
+                ? 'Discarded all remaining tasks. Previously saved tasks were not changed.'
+                : 'Discarded the remaining unfinished tasks (Tasks $current-$total). Previously saved tasks were not changed.',
+            fromUser: false,
+          ),
+        );
+        if (startNewTask) {
+          _messages.add(
+            const AssistantMessage(
+              text: 'What task would you like to create?',
+              fromUser: false,
+            ),
+          );
+        }
+      });
+      _scrollToBottom();
+    } on ApiException catch (error) {
+      _addError(error.message);
+    } catch (_) {
+      _addError('Could not discard the remaining tasks.');
+    } finally {
+      _finishSending();
+    }
+  }
+
   void _finishSending() {
     if (!mounted) return;
     setState(() {
@@ -779,6 +1821,10 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
         children: [
           _header(),
           const Divider(height: 1),
+          if (_activeBatchId != null &&
+              _activeBatchTaskNumber != null &&
+              _activeBatchTotalTasks != null)
+            _batchProgressBanner(),
           Expanded(
             child: _messages.isEmpty
                 ? _emptyState()
@@ -787,11 +1833,22 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
                     padding: const EdgeInsets.fromLTRB(16, 18, 16, 24),
                     itemCount: _messages.length,
                     itemBuilder: (context, index) {
-                      return _MessageBubble(message: _messages[index]);
+                      final message = _messages[index];
+                      return _MessageBubble(
+                        message: message,
+                        onCopy: () => _copyMessageText(message.text),
+                        onEdit: message.fromUser && message.allowEdit
+                            ? () => _editSentMessage(index)
+                            : null,
+                        onRetry: !message.fromUser && message.retryText != null
+                            ? () => _retryAssistantMessage(message.retryText!)
+                            : null,
+                      );
                     },
                   ),
           ),
-          if (_pendingCommand != null)
+          if (_pendingTaskControlIntent != null) _taskControlConfirmationCard(),
+          if (_pendingTaskControlIntent == null && _pendingCommand != null)
             _CommandPreviewCard(
               preview: _pendingCommand!,
               selectedMatchId: _selectedMatchId,
@@ -799,14 +1856,24 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
                 setState(() => _selectedMatchId = value);
               },
               onSelectTarget: _selectTarget,
-              onConfirm: () => _confirmCommand(),
-              onCreateNew: () =>
-                  _confirmCommand(duplicateDecision: 'create_new'),
-              onUpdateExisting: () => _confirmCommand(
-                duplicateDecision: 'update_existing',
-                candidateId: _selectedMatchId,
-              ),
-              onCancel: _cancelCommand,
+              onConfirm: () => _activeBatchId != null
+                  ? _confirmBatchCommand()
+                  : _confirmCommand(),
+              onCreateNew: () => _activeBatchId != null
+                  ? _confirmBatchCommand(duplicateDecision: 'create_new')
+                  : _confirmCommand(duplicateDecision: 'create_new'),
+              onUpdateExisting: () => _activeBatchId != null
+                  ? _confirmBatchCommand(
+                      duplicateDecision: 'update_existing',
+                      candidateId: _selectedMatchId,
+                    )
+                  : _confirmCommand(
+                      duplicateDecision: 'update_existing',
+                      candidateId: _selectedMatchId,
+                    ),
+              onCancel: _activeBatchId != null
+                  ? _cancelBatchCommand
+                  : _cancelCommand,
               busy: _sending,
             ),
           if (_sending)
@@ -830,7 +1897,10 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
                 ],
               ),
             ),
-          if (_suggestions.isNotEmpty && !_sending && _pendingCommand == null)
+          if (_pendingTaskControlIntent == null &&
+              _suggestions.isNotEmpty &&
+              !_sending &&
+              _pendingCommand == null)
             _suggestionChips(),
           _inputArea(),
         ],
@@ -863,13 +1933,176 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'Gemini parses task JSON. You confirm every change.',
+                  'AI interprets task requests. You confirm every change.',
                   style: TextStyle(
                     color: AppColors.of(context).textSecondary,
                     fontSize: 11,
                   ),
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _taskControlConfirmationCard() {
+    final intent = _pendingTaskControlIntent;
+    if (intent == null) return const SizedBox.shrink();
+
+    final colors = AppColors.of(context);
+    final current = _activeBatchTaskNumber ?? 1;
+    final total = _activeBatchTotalTasks ?? current;
+    final inBatch = _activeBatchId != null;
+
+    final buttons = <Widget>[];
+
+    void addButton(
+      String label,
+      VoidCallback onPressed, {
+      bool primary = false,
+    }) {
+      buttons.add(
+        primary
+            ? FilledButton(
+                onPressed: _sending ? null : onPressed,
+                child: Text(label),
+              )
+            : OutlinedButton(
+                onPressed: _sending ? null : onPressed,
+                child: Text(label),
+              ),
+      );
+    }
+
+    switch (intent) {
+      case ActiveTaskControlIntent.discardCurrent:
+        addButton('Keep Task', _continueTaskAfterControlPrompt);
+        addButton(
+          inBatch ? 'Discard Task $current' : 'Discard Task',
+          () => _confirmDiscardCurrentTask(),
+          primary: true,
+        );
+        break;
+      case ActiveTaskControlIntent.discardRemaining:
+        addButton('Keep Tasks', _continueTaskAfterControlPrompt);
+        addButton(
+          current <= 1
+              ? 'Discard Remaining Tasks'
+              : 'Discard Tasks $current-$total',
+          () => _confirmDiscardRemainingTasks(),
+          primary: true,
+        );
+        break;
+      case ActiveTaskControlIntent.skipCurrent:
+        addButton('Continue Task', _continueTaskAfterControlPrompt);
+        addButton(
+          total <= 1 ? 'Skip Task $current' : 'Skip Task $current for Now',
+          () => _confirmSkipCurrentTask(),
+          primary: true,
+        );
+        break;
+      case ActiveTaskControlIntent.startNewTask:
+        addButton('Continue Current Tasks', _continueTaskAfterControlPrompt);
+        addButton(
+          inBatch
+              ? 'Discard Remaining & Start New'
+              : 'Discard Task & Start New',
+          () => _confirmDiscardRemainingTasks(startNewTask: true),
+          primary: true,
+        );
+        break;
+      case ActiveTaskControlIntent.ambiguousStop:
+        addButton('Continue Task', _continueTaskAfterControlPrompt);
+        if (inBatch) {
+          addButton(
+            total <= 1 ? 'Skip Task $current' : 'Skip Task $current for Now',
+            () => _confirmSkipCurrentTask(),
+          );
+        }
+        addButton(
+          inBatch ? 'Discard Task $current' : 'Discard Current Task',
+          () => _confirmDiscardCurrentTask(),
+        );
+        if (inBatch) {
+          addButton(
+            current <= 1
+                ? 'Discard Remaining Tasks'
+                : 'Discard Tasks $current-$total',
+            () => _confirmDiscardRemainingTasks(),
+            primary: true,
+          );
+        }
+        break;
+      case ActiveTaskControlIntent.none:
+        break;
+    }
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: colors.surfaceElevated,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: colors.border),
+      ),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        alignment: WrapAlignment.end,
+        children: buttons,
+      ),
+    );
+  }
+
+  Widget _batchProgressBanner() {
+    final colors = AppColors.of(context);
+    final current = _activeBatchTaskNumber ?? 1;
+    final total = _activeBatchTotalTasks ?? 1;
+    final reviewed = (current - 1).clamp(0, total);
+    final progress = total <= 0 ? 0.0 : reviewed / total;
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: colors.surfaceElevated,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: colors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Task $current of $total',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Text(
+                '$reviewed of $total reviewed',
+                style: TextStyle(
+                  color: colors.textSecondary,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 9),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 5,
+              backgroundColor: colors.border,
             ),
           ),
         ],
@@ -979,6 +2212,8 @@ class _AssistantScreenState extends ConsumerState<AssistantScreen> {
             Expanded(
               child: TextField(
                 controller: _messageController,
+                enabled: _pendingTaskControlIntent == null,
+                focusNode: _messageFocusNode,
                 minLines: 1,
                 maxLines: 5,
                 textCapitalization: TextCapitalization.sentences,
@@ -1405,55 +2640,140 @@ class _CommandDetails extends StatelessWidget {
 
 class _MessageBubble extends StatelessWidget {
   final AssistantMessage message;
+  final VoidCallback onCopy;
+  final VoidCallback? onEdit;
+  final VoidCallback? onRetry;
 
-  const _MessageBubble({required this.message});
+  const _MessageBubble({
+    required this.message,
+    required this.onCopy,
+    this.onEdit,
+    this.onRetry,
+  });
 
   @override
   Widget build(BuildContext context) {
     final user = message.fromUser;
+    final colors = AppColors.of(context);
+
     return Align(
       alignment: user ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.sizeOf(context).width * 0.82,
-        ),
-        margin: const EdgeInsets.only(bottom: 13),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
-        decoration: BoxDecoration(
-          color: user
-              ? AppColors.of(context).white
-              : AppColors.of(context).surface,
-          borderRadius: BorderRadius.circular(16),
-          border: user ? null : Border.all(color: AppColors.of(context).border),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              message.text,
-              style: TextStyle(
-                color: user
-                    ? AppColors.of(context).onAccent
-                    : AppColors.of(context).textPrimary,
-                fontSize: 13,
-                height: 1.45,
-              ),
+      child: Column(
+        crossAxisAlignment: user
+            ? CrossAxisAlignment.end
+            : CrossAxisAlignment.start,
+        children: [
+          Container(
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.sizeOf(context).width * 0.82,
             ),
-            if (!user &&
-                message.model != null &&
-                message.model!.isNotEmpty) ...[
-              const SizedBox(height: 8),
-              Text(
-                'Gemini',
-                style: TextStyle(
-                  color: AppColors.of(context).textMuted,
-                  fontSize: 9,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+            decoration: BoxDecoration(
+              color: user ? colors.white : colors.surface,
+              borderRadius: BorderRadius.circular(16),
+              border: user ? null : Border.all(color: colors.border),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  message.text,
+                  style: TextStyle(
+                    color: user ? colors.onAccent : colors.textPrimary,
+                    fontSize: 13,
+                    height: 1.45,
+                  ),
                 ),
+                if (!user &&
+                    message.model != null &&
+                    message.model!.isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    _providerLabel(),
+                    style: TextStyle(color: colors.textMuted, fontSize: 9),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 3),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (onEdit != null)
+                _MessageActionButton(
+                  tooltip: 'Edit',
+                  icon: Icons.edit_outlined,
+                  onPressed: onEdit!,
+                ),
+              _MessageActionButton(
+                tooltip: 'Copy',
+                icon: Icons.copy_all_outlined,
+                onPressed: onCopy,
               ),
+              if (onRetry != null)
+                _MessageActionButton(
+                  tooltip: 'Try again',
+                  icon: Icons.refresh_rounded,
+                  onPressed: onRetry!,
+                ),
             ],
-          ],
-        ),
+          ),
+          const SizedBox(height: 8),
+        ],
       ),
+    );
+  }
+
+  String _providerLabel() {
+    final raw = message.provider?.trim().toLowerCase();
+
+    final provider = switch (raw) {
+      'gemini' => 'Gemini',
+      'groq' => 'Groq',
+      'cloudflare' => 'Cloudflare',
+      'openrouter' => 'OpenRouter',
+      'cerebras' => 'Cerebras',
+      'mistral' => 'Mistral',
+      'nvidia' => 'NVIDIA',
+      _ =>
+        message.provider?.trim().isNotEmpty == true
+            ? message.provider!.trim()
+            : 'AI',
+    };
+
+    final model = message.model?.trim() ?? '';
+
+    final parts = <String>[
+      provider,
+      if (model.isNotEmpty) model,
+      if (message.fallbackUsed) 'fallback',
+    ];
+
+    return parts.join(' · ');
+  }
+}
+
+class _MessageActionButton extends StatelessWidget {
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  const _MessageActionButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      visualDensity: VisualDensity.compact,
+      padding: const EdgeInsets.all(5),
+      constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+      icon: Icon(icon, size: 17, color: AppColors.of(context).textMuted),
     );
   }
 }

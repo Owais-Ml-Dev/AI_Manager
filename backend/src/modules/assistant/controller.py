@@ -3,6 +3,20 @@
 from bson.errors import InvalidId
 from flask import jsonify, request
 
+from src.modules.assistant.batch_parser import (
+    TaskBatchParserError,
+    parse_task_batch_message,
+)
+from src.modules.assistant.batches.service import (
+    AssistantBatchError,
+    abort_task_batch,
+    cancel_active_task,
+    confirm_active_task,
+    continue_active_task,
+    defer_active_task,
+    create_task_batch,
+    prepare_active_task,
+)
 from src.modules.assistant.credentials.service import (
     CredentialValidationError,
     get_provider_credential_status,
@@ -50,6 +64,36 @@ def _request_provider_credentials():
         "openrouter_api_key": request.headers.get(
             "X-OpenRouter-Api-Key", ""
         ).strip(),
+        "cerebras_api_key": request.headers.get(
+            "X-Cerebras-Api-Key", ""
+        ).strip(),
+
+        "mistral_api_key": request.headers.get(
+            "X-Mistral-Api-Key", ""
+        ).strip(),
+
+        "nvidia_api_key": request.headers.get(
+            "X-Nvidia-Api-Key", ""
+        ).strip(),
+        "preferred_provider": request.headers.get(
+            "X-AI-Preferred-Provider",
+            "",
+        ).strip().lower(),
+
+        "auto_fallback": (
+            request.headers.get(
+                "X-AI-Auto-Fallback",
+                "true",
+            )
+            .strip()
+            .lower()
+            not in (
+                "0",
+                "false",
+                "off",
+                "no",
+            )
+        ),
     }
 
 
@@ -60,6 +104,10 @@ def _has_non_gemini_credentials(credentials):
             "groq_api_key",
             "cloudflare_api_token",
             "openrouter_api_key",
+            "cerebras_api_key",
+            "mistral_api_key",
+            "nvidia_api_key",
+            "preferred_provider",
         )
     )
 
@@ -88,6 +136,13 @@ def _draft_error_response(error):
     if getattr(error, "errors", None):
         response["errors"] = error.errors
     return jsonify(response), error.status_code
+
+
+def _batch_error_response(error):
+    return jsonify({
+        "success": False,
+        "message": error.message,
+    }), error.status_code
 
 
 def get_assistant_health_controller():
@@ -313,6 +368,261 @@ def execute_task_command_controller():
         return _draft_error_response(error)
     except InvalidId:
         return jsonify({"success": False, "message": "Invalid assistant draft ID."}), 400
+
+    return jsonify({"success": True, "data": result}), 200
+
+
+# =========================================================
+# MULTI-TASK BATCH WORKFLOW
+# =========================================================
+
+def start_task_batch_controller():
+    """Parse one message into an ordered task batch and prepare Task 1."""
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Request body is required.",
+        }), 400
+
+    message = data.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return jsonify({
+            "success": False,
+            "message": "message is required and must be a non-empty string.",
+        }), 400
+
+    timezone_name = data.get("timezone", "UTC")
+    if not isinstance(timezone_name, str):
+        return jsonify({
+            "success": False,
+            "message": "timezone must be a string.",
+        }), 400
+
+    timezone_name = timezone_name.strip() or "UTC"
+
+    try:
+        credentials = _request_provider_credentials()
+        parse_kwargs = {
+            "message": message.strip(),
+            "timezone_name": timezone_name,
+            "api_key": _request_gemini_api_key(),
+        }
+        if _has_non_gemini_credentials(credentials):
+            parse_kwargs["credentials"] = credentials
+
+        parsed = parse_task_batch_message(**parse_kwargs)
+        batch = create_task_batch(
+            parsed,
+            source_message=message.strip(),
+        )
+        active_task = prepare_active_task(batch["batch_id"])
+
+    except TaskBatchParserError as error:
+        return jsonify({
+            "success": False,
+            "message": error.message,
+        }), error.status_code
+    except AssistantBatchError as error:
+        return _batch_error_response(error)
+    except (
+        ProviderNotConfiguredError,
+        ProviderConnectionError,
+        ProviderResponseError,
+    ) as error:
+        return _provider_error_response(error)
+
+    result = {
+        **batch,
+        "provider": parsed.get("provider", ""),
+        "model": parsed.get("model", ""),
+        "fallback_used": bool(parsed.get("fallback_used", False)),
+        "attempted_providers": list(parsed.get("attempted_providers") or []),
+        "active_task": active_task,
+    }
+
+    return jsonify({"success": True, "data": result}), 201
+
+
+def get_active_task_batch_controller(batch_id):
+    """Return/recover the current active task and its existing draft."""
+
+    try:
+        result = prepare_active_task(batch_id)
+    except AssistantBatchError as error:
+        return _batch_error_response(error)
+
+    return jsonify({"success": True, "data": result}), 200
+
+
+def continue_task_batch_controller(batch_id):
+    """Apply one follow-up answer to the currently active batch task."""
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Request body is required.",
+        }), 400
+
+    message = data.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return jsonify({
+            "success": False,
+            "message": "message is required and must be a non-empty string.",
+        }), 400
+
+    try:
+        credentials = _request_provider_credentials()
+        kwargs = {
+            "batch_id": batch_id,
+            "message": message.strip(),
+            "api_key": _request_gemini_api_key(),
+        }
+        if _has_non_gemini_credentials(credentials):
+            kwargs["credentials"] = credentials
+
+        result = continue_active_task(**kwargs)
+
+    except AssistantBatchError as error:
+        return _batch_error_response(error)
+    except (
+        ProviderNotConfiguredError,
+        ProviderConnectionError,
+        ProviderResponseError,
+    ) as error:
+        return _provider_error_response(error)
+
+    return jsonify({"success": True, "data": result}), 200
+
+
+def confirm_task_batch_controller(batch_id):
+    """Confirm and execute only the currently active batch task."""
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Request body is required.",
+        }), 400
+
+    draft_id = data.get("draft_id")
+    if not isinstance(draft_id, str) or not draft_id.strip():
+        return jsonify({
+            "success": False,
+            "message": "draft_id is required.",
+        }), 400
+
+    duplicate_decision = data.get("duplicate_decision")
+    candidate_id = data.get("candidate_id")
+
+    if duplicate_decision is not None and duplicate_decision not in {
+        "create_new",
+        "update_existing",
+    }:
+        return jsonify({
+            "success": False,
+            "message": "duplicate_decision must be create_new or update_existing.",
+        }), 400
+
+    if candidate_id is not None and not isinstance(candidate_id, str):
+        return jsonify({
+            "success": False,
+            "message": "candidate_id must be a string.",
+        }), 400
+
+    try:
+        result = confirm_active_task(
+            batch_id,
+            draft_id.strip(),
+            duplicate_decision=duplicate_decision,
+            candidate_id=(
+                candidate_id.strip()
+                if isinstance(candidate_id, str)
+                else None
+            ),
+        )
+    except AssistantBatchError as error:
+        return _batch_error_response(error)
+
+    return jsonify({"success": True, "data": result}), 200
+
+
+def defer_task_batch_controller(batch_id):
+    """Skip the current task for now, preserving its draft for a later revisit."""
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Request body is required.",
+        }), 400
+
+    draft_id = data.get("draft_id")
+    if not isinstance(draft_id, str) or not draft_id.strip():
+        return jsonify({
+            "success": False,
+            "message": "draft_id is required.",
+        }), 400
+
+    try:
+        result = defer_active_task(batch_id, draft_id.strip())
+    except AssistantBatchError as error:
+        return _batch_error_response(error)
+
+    return jsonify({"success": True, "data": result}), 200
+
+
+def abort_task_batch_controller(batch_id):
+    """Discard all unfinished tasks in the active batch."""
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Request body is required.",
+        }), 400
+
+    draft_id = data.get("draft_id")
+    if not isinstance(draft_id, str) or not draft_id.strip():
+        return jsonify({
+            "success": False,
+            "message": "draft_id is required.",
+        }), 400
+
+    try:
+        result = abort_task_batch(batch_id, draft_id.strip())
+    except AssistantBatchError as error:
+        return _batch_error_response(error)
+
+    return jsonify({"success": True, "data": result}), 200
+
+
+def cancel_task_batch_controller(batch_id):
+    """Discard only the currently active batch task and prepare the next one."""
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "Request body is required.",
+        }), 400
+
+    draft_id = data.get("draft_id")
+    if not isinstance(draft_id, str) or not draft_id.strip():
+        return jsonify({
+            "success": False,
+            "message": "draft_id is required.",
+        }), 400
+
+    try:
+        result = cancel_active_task(
+            batch_id,
+            draft_id.strip(),
+        )
+    except AssistantBatchError as error:
+        return _batch_error_response(error)
 
     return jsonify({"success": True, "data": result}), 200
 

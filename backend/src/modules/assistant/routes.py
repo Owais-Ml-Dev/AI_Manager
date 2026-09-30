@@ -4,6 +4,13 @@ from flask import Blueprint
 
 from src.modules.assistant.controller import (
     assistant_chat_controller,
+    abort_task_batch_controller,
+    cancel_task_batch_controller,
+    confirm_task_batch_controller,
+    continue_task_batch_controller,
+    defer_task_batch_controller,
+    get_active_task_batch_controller,
+    start_task_batch_controller,
     create_live_token_controller,
     create_assistant_live_token_controller,
     delete_assistant_credential_controller,
@@ -63,4 +70,28 @@ assistant_bp.route("/task-command/select-target", methods=["POST"])(
 )
 assistant_bp.route("/task-command/execute", methods=["POST"])(
     execute_task_command_controller
+)
+
+
+# Ordered multi-task creation workflow.
+assistant_bp.route("/task-batch/start", methods=["POST"])(
+    start_task_batch_controller
+)
+assistant_bp.route("/task-batch/<batch_id>/active", methods=["GET"])(
+    get_active_task_batch_controller
+)
+assistant_bp.route("/task-batch/<batch_id>/continue", methods=["POST"])(
+    continue_task_batch_controller
+)
+assistant_bp.route("/task-batch/<batch_id>/confirm", methods=["POST"])(
+    confirm_task_batch_controller
+)
+assistant_bp.route("/task-batch/<batch_id>/cancel", methods=["POST"])(
+    cancel_task_batch_controller
+)
+assistant_bp.route("/task-batch/<batch_id>/defer", methods=["POST"])(
+    defer_task_batch_controller
+)
+assistant_bp.route("/task-batch/<batch_id>/abort", methods=["POST"])(
+    abort_task_batch_controller
 )

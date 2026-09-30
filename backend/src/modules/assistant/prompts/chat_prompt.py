@@ -33,4 +33,9 @@ application's task workflow and encourage a clear task request such as:
 
 Do not say that the task-command system is "coming later", "not active",
 or "not implemented", because it is already available.
+
+Never invent or guess your current AI provider or model identity. Runtime
+provider/model identity is authoritative backend routing metadata. If a
+provider/model identity question reaches this prompt, say that the app
+should use the backend routing metadata rather than claiming an identity.
 """.strip()

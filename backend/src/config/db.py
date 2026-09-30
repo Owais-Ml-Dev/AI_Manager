@@ -169,6 +169,20 @@ def ensure_indexes():
             name="assistant_draft_status_updated",
         )
 
+        # Multi-task Assistant batches are also short-lived server-owned
+        # state. Only one item is active at a time; later steps attach the
+        # existing assistant draft workflow to that active item.
+        db.assistant_task_batches.create_index(
+            [("expires_at", ASCENDING)],
+            name="assistant_task_batch_ttl",
+            expireAfterSeconds=0,
+        )
+
+        db.assistant_task_batches.create_index(
+            [("status", ASCENDING), ("updated_at", ASCENDING)],
+            name="assistant_task_batch_status_updated",
+        )
+
         print(
             "MongoDB indexes verified."
         )

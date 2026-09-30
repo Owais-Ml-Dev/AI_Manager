@@ -14,6 +14,9 @@ class AssistantSettingsRepository {
     'groq': 'openai/gpt-oss-20b',
     'cloudflare': '@cf/openai/gpt-oss-20b',
     'openrouter': 'openrouter/free',
+    'cerebras': 'gpt-oss-120b',
+    'mistral': 'mistral-small-latest',
+    'nvidia': 'openai/gpt-oss-20b',
   };
 
   static const _providerLabels = <String, String>{
@@ -21,11 +24,16 @@ class AssistantSettingsRepository {
     'groq': 'Groq',
     'cloudflare': 'Cloudflare Workers AI',
     'openrouter': 'OpenRouter Free',
+    'cerebras': 'Cerebras',
+    'mistral': 'Mistral',
+    'nvidia': 'NVIDIA NIM',
   };
 
   Future<AssistantSettingsData> fetch() async {
     final providers = <AssistantProviderSettings>[];
     final cloudflareAccountId = await _keyStore.readCloudflareAccountId();
+
+    final autoFallback = await _keyStore.readAutoFallback();
 
     for (final provider in _providerModels.keys) {
       final key = await _keyStore.readProviderApiKey(provider);
@@ -46,10 +54,17 @@ class AssistantSettingsRepository {
 
     return AssistantSettingsData(
       providers: providers,
+      autoFallback: autoFallback,
       message: providers.any((item) => item.configured)
-          ? 'Automatic fallback is enabled. The first available provider is used.'
+          ? autoFallback
+                ? 'Automatic fallback is enabled.'
+                : 'Automatic fallback is disabled.'
           : 'Add at least one provider API key to use the AI Assistant.',
     );
+  }
+
+  Future<void> saveAutoFallback(bool enabled) {
+    return _keyStore.saveAutoFallback(enabled);
   }
 
   Future<void> testAndSaveProvider(
@@ -91,6 +106,18 @@ class AssistantSettingsRepository {
       case 'openrouter':
         headers['X-OpenRouter-Api-Key'] = normalized;
         break;
+
+      case 'cerebras':
+        headers['X-Cerebras-Api-Key'] = normalized;
+        break;
+
+      case 'mistral':
+        headers['X-Mistral-Api-Key'] = normalized;
+        break;
+
+      case 'nvidia':
+        headers['X-Nvidia-Api-Key'] = normalized;
+        break;
       default:
         throw ApiException(message: 'Unsupported AI provider: $provider');
     }
@@ -122,6 +149,14 @@ class AssistantSettingsRepository {
     if (provider == 'cloudflare') {
       await _keyStore.deleteCloudflareAccountId();
     }
+  }
+
+  Future<String> readPreferredProvider() {
+    return _keyStore.readPreferredProvider();
+  }
+
+  Future<void> savePreferredProvider(String provider) {
+    return _keyStore.savePreferredProvider(provider);
   }
 
   // Existing Gemini API remains available for older callers.

@@ -31,4 +31,29 @@ void main() {
       expect(looksLikeTaskAction('How do I create better habits?'), isFalse);
     });
   });
+
+  group('Assistant create routing', () {
+    test('new create requests use the batch creation path', () {
+      expect(
+        looksLikeCreateTaskAction(
+          'Create a gym task and call Mom on Sunday',
+        ),
+        isTrue,
+      );
+      expect(looksLikeCreateTaskAction('Remind me to pay rent tomorrow'), isTrue);
+      expect(looksLikeCreateTaskAction('Gym task'), isTrue);
+    });
+
+    test('non-create task actions do not use batch creation', () {
+      expect(looksLikeCreateTaskAction('Update my gym task'), isFalse);
+      expect(looksLikeCreateTaskAction('Complete my gym task'), isFalse);
+      expect(looksLikeCreateTaskAction('Delete my gym task'), isFalse);
+      expect(looksLikeCreateTaskAction('Show my tasks'), isFalse);
+    });
+
+    test('general questions do not use batch creation', () {
+      expect(looksLikeCreateTaskAction('How do I create better habits?'), isFalse);
+    });
+  });
+
 }

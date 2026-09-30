@@ -1,0 +1,131 @@
+bool looksLikeTaskAction(String message) {
+  final text = message.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+  if (text.isEmpty) {
+    return false;
+  }
+
+  // ------------------------------------------------------
+  // NORMAL EXPLANATION / INFORMATION QUESTIONS
+  // ------------------------------------------------------
+
+  final normalQuestion = RegExp(
+    r'^(how do i|how can i|why|explain|tell me about)\b',
+  );
+
+  if (normalQuestion.hasMatch(text) &&
+      !text.contains('my task') &&
+      !text.contains('my tasks')) {
+    return false;
+  }
+
+  // ------------------------------------------------------
+  // EXPLICIT TASK COMMANDS
+  // ------------------------------------------------------
+
+  final commandPatterns = <RegExp>[
+    // Create
+    RegExp(r'^(create|add|schedule|make|set|plan)\b'),
+
+    RegExp(r'\bremind me\b'),
+
+    RegExp(r'\bset (a )?reminder\b'),
+
+    // Update
+    RegExp(r'^(edit|update|change|rename|reschedule|move)\b'),
+
+    // Complete / Delete
+    RegExp(r'^(complete|finish|delete|remove|cancel|stop)\b'),
+
+    RegExp(r'\bmark\b.*\b(done|complete|completed)\b'),
+
+    // Read/list
+    RegExp(r'\b(show|list|display)\b.*\btasks?\b'),
+
+    RegExp(r'\bwhat\b.*\bmy tasks?\b'),
+
+    RegExp(r'\bhow many\b.*\btasks?\b'),
+  ];
+
+  if (commandPatterns.any((pattern) => pattern.hasMatch(text))) {
+    return true;
+  }
+
+  // ------------------------------------------------------
+  // NATURAL TASK PHRASES
+  // ------------------------------------------------------
+  //
+  // Examples:
+  //
+  // "Swimming task"
+  // "Gym task"
+  // "Morning workout task"
+  // "Medicine reminder"
+  // "Call mom reminder"
+  //
+  // These should enter the structured task-command flow
+  // even when the user does not explicitly say "create".
+  //
+
+  if (RegExp(r'\btasks?\b').hasMatch(text)) {
+    return true;
+  }
+
+  if (RegExp(r'\breminders?\b').hasMatch(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+bool looksLikeCreateTaskAction(String message) {
+  final text = message.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+  if (text.isEmpty) {
+    return false;
+  }
+
+  // General explanation questions must stay normal chat.
+  if (RegExp(r'^(how do i|how can i|why|explain|tell me about)\b')
+      .hasMatch(text)) {
+    return false;
+  }
+
+  // Never route non-create task operations into the batch-create API.
+  if (RegExp(
+    r'\b(edit|update|change|rename|reschedule|move|complete|finish|delete|remove|cancel|stop|show|list|display)\b',
+  ).hasMatch(text)) {
+    return false;
+  }
+
+  if (RegExp(r'\bmark\b.*\b(done|complete|completed)\b').hasMatch(text)) {
+    return false;
+  }
+
+  // Explicit create language.
+  if (RegExp(r'^(create|add|schedule|make|set|plan)\b').hasMatch(text) ||
+      RegExp(r'\bremind me\b').hasMatch(text) ||
+      RegExp(r'\bset (a )?reminder\b').hasMatch(text)) {
+    return true;
+  }
+
+  // Preserve the existing "Gym task" / "Medicine reminder" shorthand.
+  // At this point known read/update/delete/complete verbs were excluded above.
+  return RegExp(r'\btasks?\b').hasMatch(text) ||
+      RegExp(r'\breminders?\b').hasMatch(text);
+}
+
+bool shouldInterruptTaskDraft(String message) {
+  final text = message.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+  if (text.isEmpty) {
+    return false;
+  }
+
+  // A clear read-only task command is a NEW command,
+  // even if the Assistant is currently waiting for a
+  // duration, repeat rule, reminder, etc.
+  return RegExp(r'\b(show|list|display)\b.*\btasks?\b').hasMatch(text) ||
+      RegExp(r'\bwhat\b.*\bmy tasks?\b').hasMatch(text) ||
+      RegExp(r'\bhow many\b.*\btasks?\b').hasMatch(text);
+}

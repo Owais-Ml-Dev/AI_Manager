@@ -20,9 +20,16 @@ class AssistantLiveToken {
 
 class AssistantChatResult {
   final String reply;
+  final String provider;
   final String model;
+  final bool fallbackUsed;
 
-  const AssistantChatResult({required this.reply, required this.model});
+  const AssistantChatResult({
+    required this.reply,
+    required this.provider,
+    required this.model,
+    required this.fallbackUsed,
+  });
 }
 
 class AssistantTaskMatch {
@@ -96,6 +103,180 @@ class AssistantCommandPreview {
   }
 }
 
+Map<String, dynamic> _assistantMap(dynamic value) {
+  if (value is! Map) return <String, dynamic>{};
+  return value.map((key, value) => MapEntry(key.toString(), value));
+}
+
+List<dynamic> _assistantList(dynamic value) {
+  if (value is! List) return const <dynamic>[];
+  return value;
+}
+
+AssistantCommandPreview _assistantPreviewFromMap(Map<String, dynamic> data) {
+  return AssistantCommandPreview(
+    model: data['model']?.toString() ?? '',
+    timezone: data['timezone']?.toString() ?? '',
+    draftId: data['draft_id']?.toString() ?? '',
+    status: data['status']?.toString() ?? '',
+    question: data['question']?.toString(),
+    missingFields: _assistantList(data['missing_fields'])
+        .map((value) => value.toString())
+        .toList(),
+    command: _assistantMap(data['command']),
+    duplicateMatches: _assistantList(data['duplicate_matches'])
+        .map(_assistantMap)
+        .map(AssistantTaskMatch.fromMap)
+        .where((match) => match.id.isNotEmpty)
+        .toList(),
+    targetMatches: _assistantList(data['target_matches'])
+        .map(_assistantMap)
+        .map(AssistantTaskMatch.fromMap)
+        .where((match) => match.id.isNotEmpty)
+        .toList(),
+    suggestions: _assistantList(data['suggestions'])
+        .map((value) => value.toString())
+        .where((value) => value.isNotEmpty)
+        .toList(),
+  );
+}
+
+class AssistantTaskBatchStartResult {
+  final String batchId;
+  final int totalTasks;
+  final int currentTaskNumber;
+  final String provider;
+  final String model;
+  final bool fallbackUsed;
+  final AssistantCommandPreview activeDraft;
+
+  const AssistantTaskBatchStartResult({
+    required this.batchId,
+    required this.totalTasks,
+    required this.currentTaskNumber,
+    required this.provider,
+    required this.model,
+    required this.fallbackUsed,
+    required this.activeDraft,
+  });
+
+  bool get hasMultipleTasks => totalTasks > 1;
+
+  factory AssistantTaskBatchStartResult.fromMap(Map<String, dynamic> data) {
+    final activeTask = _assistantMap(data['active_task']);
+    final draft = _assistantMap(activeTask['draft']);
+
+    int asInt(dynamic value) {
+      if (value is int) return value;
+      if (value is num) return value.toInt();
+      return int.tryParse(value?.toString() ?? '') ?? 0;
+    }
+
+    return AssistantTaskBatchStartResult(
+      batchId: data['batch_id']?.toString() ?? '',
+      totalTasks: asInt(data['total_tasks']),
+      currentTaskNumber: asInt(data['current_task_number']),
+      provider: data['provider']?.toString() ?? '',
+      model: data['model']?.toString() ?? '',
+      fallbackUsed: data['fallback_used'] == true,
+      activeDraft: _assistantPreviewFromMap(draft),
+    );
+  }
+}
+
+class AssistantTaskBatchActiveResult {
+  final String batchId;
+  final String batchStatus;
+  final int totalTasks;
+  final int currentTaskNumber;
+  final String itemStatus;
+  final AssistantCommandPreview activeDraft;
+
+  const AssistantTaskBatchActiveResult({
+    required this.batchId,
+    required this.batchStatus,
+    required this.totalTasks,
+    required this.currentTaskNumber,
+    required this.itemStatus,
+    required this.activeDraft,
+  });
+
+  factory AssistantTaskBatchActiveResult.fromMap(Map<String, dynamic> data) {
+    int asInt(dynamic value) {
+      if (value is int) return value;
+      if (value is num) return value.toInt();
+      return int.tryParse(value?.toString() ?? '') ?? 0;
+    }
+
+    return AssistantTaskBatchActiveResult(
+      batchId: data['batch_id']?.toString() ?? '',
+      batchStatus: data['batch_status']?.toString() ?? '',
+      totalTasks: asInt(data['total_tasks']),
+      currentTaskNumber: asInt(data['current_task_number']),
+      itemStatus: data['item_status']?.toString() ?? '',
+      activeDraft: _assistantPreviewFromMap(_assistantMap(data['draft'])),
+    );
+  }
+}
+
+class AssistantTaskBatchResolutionResult {
+  final String batchId;
+  final String batchStatus;
+  final int resolvedTaskNumber;
+  final String resolution;
+  final int? currentTaskNumber;
+  final int totalTasks;
+  final bool allDone;
+  final AssistantTaskBatchActiveResult? nextTask;
+  final String? nextTaskError;
+
+  const AssistantTaskBatchResolutionResult({
+    required this.batchId,
+    required this.batchStatus,
+    required this.resolvedTaskNumber,
+    required this.resolution,
+    required this.currentTaskNumber,
+    required this.totalTasks,
+    required this.allDone,
+    required this.nextTask,
+    required this.nextTaskError,
+  });
+
+  factory AssistantTaskBatchResolutionResult.fromMap(
+    Map<String, dynamic> data,
+  ) {
+    int asInt(dynamic value) {
+      if (value is int) return value;
+      if (value is num) return value.toInt();
+      return int.tryParse(value?.toString() ?? '') ?? 0;
+    }
+
+    int? asNullableInt(dynamic value) {
+      if (value == null) return null;
+      if (value is int) return value;
+      if (value is num) return value.toInt();
+      return int.tryParse(value.toString());
+    }
+
+    final nextTaskMap = _assistantMap(data['next_task']);
+    final nextTaskErrorMap = _assistantMap(data['next_task_error']);
+
+    return AssistantTaskBatchResolutionResult(
+      batchId: data['batch_id']?.toString() ?? '',
+      batchStatus: data['batch_status']?.toString() ?? '',
+      resolvedTaskNumber: asInt(data['resolved_task_number']),
+      resolution: data['resolution']?.toString() ?? '',
+      currentTaskNumber: asNullableInt(data['current_task_number']),
+      totalTasks: asInt(data['total_tasks']),
+      allDone: data['all_done'] == true,
+      nextTask: nextTaskMap.isEmpty
+          ? null
+          : AssistantTaskBatchActiveResult.fromMap(nextTaskMap),
+      nextTaskError: nextTaskErrorMap['message']?.toString(),
+    );
+  }
+}
+
 class AssistantRepository {
   final ApiClient _apiClient;
   final GeminiApiKeyStore _keyStore;
@@ -136,8 +317,177 @@ class AssistantRepository {
     final data = _asMap(result);
     return AssistantChatResult(
       reply: data['reply']?.toString() ?? '',
+      provider: data['provider']?.toString() ?? '',
       model: data['model']?.toString() ?? '',
+      fallbackUsed: data['fallback_used'] == true,
     );
+  }
+
+  Future<AssistantTaskBatchStartResult> startTaskBatch(
+    String message, {
+    CancelToken? cancelToken,
+  }) async {
+    final headers = await _providerHeaders();
+
+    final result = await _apiClient.post(
+      '/api/assistant/task-batch/start',
+      data: <String, dynamic>{
+        'message': message,
+        'timezone': _deviceUtcOffset(),
+      },
+      cancelToken: cancelToken,
+      headers: headers,
+    );
+
+    final batch = AssistantTaskBatchStartResult.fromMap(_asMap(result));
+
+    if (batch.batchId.isEmpty || batch.activeDraft.draftId.isEmpty) {
+      throw const ApiException(
+        message: 'The backend returned an invalid task batch.',
+      );
+    }
+
+    return batch;
+  }
+
+  Future<AssistantTaskBatchActiveResult> getActiveTaskBatch(
+    String batchId,
+  ) async {
+    final result = await _apiClient.get(
+      '/api/assistant/task-batch/$batchId/active',
+    );
+
+    final active = AssistantTaskBatchActiveResult.fromMap(_asMap(result));
+
+    if (active.batchId.isEmpty || active.activeDraft.draftId.isEmpty) {
+      throw const ApiException(
+        message: 'The backend returned an invalid active batch task.',
+      );
+    }
+
+    return active;
+  }
+
+  Future<AssistantTaskBatchActiveResult> continueTaskBatch({
+    required String batchId,
+    required String message,
+    CancelToken? cancelToken,
+  }) async {
+    final headers = await _providerHeaders();
+
+    final result = await _apiClient.post(
+      '/api/assistant/task-batch/$batchId/continue',
+      data: <String, dynamic>{'message': message},
+      cancelToken: cancelToken,
+      headers: headers,
+    );
+
+    final active = AssistantTaskBatchActiveResult.fromMap(_asMap(result));
+
+    if (active.batchId.isEmpty || active.activeDraft.draftId.isEmpty) {
+      throw const ApiException(
+        message: 'The backend returned an invalid active batch task.',
+      );
+    }
+
+    return active;
+  }
+
+  Future<AssistantTaskBatchResolutionResult> confirmTaskBatch({
+    required String batchId,
+    required String draftId,
+    String? duplicateDecision,
+    String? candidateId,
+  }) async {
+    final payload = <String, dynamic>{'draft_id': draftId};
+
+    if (duplicateDecision != null) {
+      payload['duplicate_decision'] = duplicateDecision;
+    }
+    if (candidateId != null) {
+      payload['candidate_id'] = candidateId;
+    }
+
+    final result = await _apiClient.post(
+      '/api/assistant/task-batch/$batchId/confirm',
+      data: payload,
+    );
+
+    final resolution = AssistantTaskBatchResolutionResult.fromMap(
+      _asMap(result),
+    );
+
+    if (resolution.batchId.isEmpty || resolution.resolvedTaskNumber < 1) {
+      throw const ApiException(
+        message: 'The backend returned an invalid batch confirmation result.',
+      );
+    }
+
+    return resolution;
+  }
+
+  Future<AssistantTaskBatchResolutionResult> cancelTaskBatch({
+    required String batchId,
+    required String draftId,
+  }) async {
+    final result = await _apiClient.post(
+      '/api/assistant/task-batch/$batchId/cancel',
+      data: <String, dynamic>{'draft_id': draftId},
+    );
+
+    final resolution = AssistantTaskBatchResolutionResult.fromMap(
+      _asMap(result),
+    );
+
+    if (resolution.batchId.isEmpty || resolution.resolvedTaskNumber < 1) {
+      throw const ApiException(
+        message: 'The backend returned an invalid batch cancellation result.',
+      );
+    }
+
+    return resolution;
+  }
+
+  Future<AssistantTaskBatchResolutionResult> deferTaskBatch({
+    required String batchId,
+    required String draftId,
+  }) async {
+    final result = await _apiClient.post(
+      '/api/assistant/task-batch/$batchId/defer',
+      data: <String, dynamic>{'draft_id': draftId},
+    );
+
+    final resolution = AssistantTaskBatchResolutionResult.fromMap(
+      _asMap(result),
+    );
+
+    if (resolution.batchId.isEmpty || resolution.resolvedTaskNumber < 1) {
+      throw const ApiException(
+        message: 'The backend returned an invalid batch skip result.',
+      );
+    }
+
+    return resolution;
+  }
+
+  Future<Map<String, dynamic>> abortTaskBatch({
+    required String batchId,
+    required String draftId,
+  }) async {
+    final result = await _apiClient.post(
+      '/api/assistant/task-batch/$batchId/abort',
+      data: <String, dynamic>{'draft_id': draftId},
+    );
+
+    final data = _asMap(result);
+    if (data['batch_id']?.toString().isEmpty != false ||
+        data['batch_status']?.toString() != 'aborted') {
+      throw const ApiException(
+        message: 'The backend returned an invalid batch discard result.',
+      );
+    }
+
+    return data;
   }
 
   Future<AssistantCommandPreview> previewTaskCommand(
@@ -244,6 +594,11 @@ class AssistantRepository {
     final cloudflare = await _keyStore.readProviderApiKey('cloudflare');
     final cloudflareAccountId = await _keyStore.readCloudflareAccountId();
     final openrouter = await _keyStore.readProviderApiKey('openrouter');
+    final cerebras = await _keyStore.readProviderApiKey('cerebras');
+
+    final mistral = await _keyStore.readProviderApiKey('mistral');
+
+    final nvidia = await _keyStore.readProviderApiKey('nvidia');
 
     if (gemini != null) headers['X-Gemini-Api-Key'] = gemini;
     if (groq != null) headers['X-Groq-Api-Key'] = groq;
@@ -253,11 +608,31 @@ class AssistantRepository {
     }
     if (openrouter != null) headers['X-OpenRouter-Api-Key'] = openrouter;
 
+    if (cerebras != null) {
+      headers['X-Cerebras-Api-Key'] = cerebras;
+    }
+
+    if (mistral != null) {
+      headers['X-Mistral-Api-Key'] = mistral;
+    }
+
+    if (nvidia != null) {
+      headers['X-Nvidia-Api-Key'] = nvidia;
+    }
+
     if (headers.isEmpty) {
       throw const ApiException(
         message: 'Add at least one AI provider API key in Settings first.',
       );
     }
+
+    final autoFallback = await _keyStore.readAutoFallback();
+
+    headers['X-AI-Auto-Fallback'] = autoFallback ? 'true' : 'false';
+
+    final preferredProvider = await _keyStore.readPreferredProvider();
+
+    headers['X-AI-Preferred-Provider'] = preferredProvider;
 
     return headers;
   }

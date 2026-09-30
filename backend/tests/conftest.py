@@ -124,6 +124,7 @@ def clean_test_database(request):
     db.assistant_preferences.delete_many({})
     db.assistant_credentials.delete_many({})
     db.assistant_drafts.delete_many({})
+    db.assistant_task_batches.delete_many({})
 
     yield
 
@@ -132,3 +133,4 @@ def clean_test_database(request):
     db.assistant_preferences.delete_many({})
     db.assistant_credentials.delete_many({})
     db.assistant_drafts.delete_many({})
+    db.assistant_task_batches.delete_many({})

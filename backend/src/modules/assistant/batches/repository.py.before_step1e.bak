@@ -1,0 +1,51 @@
+"""MongoDB repository for assistant multi-task batches."""
+
+from bson import ObjectId
+from pymongo import ReturnDocument
+
+from src.config.db import get_db
+
+
+def insert_batch(document):
+    db = get_db()
+    result = db.assistant_task_batches.insert_one(document)
+    return result.inserted_id
+
+
+def find_batch(batch_id):
+    db = get_db()
+    return db.assistant_task_batches.find_one({"_id": ObjectId(batch_id)})
+
+def attach_draft_to_active_item(
+    batch_id,
+    item_index,
+    draft_id,
+    updated_at,
+    expires_at,
+):
+    """Attach a draft once, only to the currently active batch item."""
+
+    db = get_db()
+    return db.assistant_task_batches.find_one_and_update(
+        {
+            "_id": ObjectId(batch_id),
+            "status": "in_progress",
+            "current_index": item_index,
+            "items": {
+                "$elemMatch": {
+                    "index": item_index,
+                    "status": "active",
+                    "draft_id": None,
+                }
+            },
+        },
+        {
+            "$set": {
+                "items.$.draft_id": str(draft_id),
+                "updated_at": updated_at,
+                "expires_at": expires_at,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+

@@ -24,6 +24,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     'groq': TextEditingController(),
     'cloudflare': TextEditingController(),
     'openrouter': TextEditingController(),
+    'cerebras': TextEditingController(),
+    'mistral': TextEditingController(),
+    'nvidia': TextEditingController(),
   };
 
   final _cloudflareAccountController = TextEditingController();
@@ -33,11 +36,18 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     'groq': true,
     'cloudflare': true,
     'openrouter': true,
+    'cerebras': true,
+    'mistral': true,
+    'nvidia': true,
   };
 
   String _selectedProvider = 'gemini';
 
   String? _savingProvider;
+  bool _savingFallback = false;
+
+  String _preferredProvider = 'gemini';
+  bool _savingPreferred = false;
 
   @override
   void initState() {
@@ -57,8 +67,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     super.dispose();
   }
 
-  Future<AssistantSettingsData> _load() {
-    return ref.read(assistantSettingsRepositoryProvider).fetch();
+  Future<AssistantSettingsData> _load() async {
+    final repository = ref.read(assistantSettingsRepositoryProvider);
+
+    final data = await repository.fetch();
+
+    _preferredProvider = await repository.readPreferredProvider();
+
+    return data;
   }
 
   Future<void> _reload() async {
@@ -67,6 +83,52 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     });
 
     await _future;
+  }
+
+  Future<void> _setAutoFallback(bool enabled) async {
+    if (_savingFallback) {
+      return;
+    }
+
+    setState(() {
+      _savingFallback = true;
+    });
+
+    try {
+      await ref
+          .read(assistantSettingsRepositoryProvider)
+          .saveAutoFallback(enabled);
+
+      if (!mounted) {
+        return;
+      }
+
+      await _reload();
+
+      if (!mounted) {
+        return;
+      }
+
+      _showMessage(
+        enabled
+            ? 'Automatic fallback enabled.'
+            : 'Automatic fallback disabled.',
+      );
+    } on ApiException catch (error) {
+      if (mounted) {
+        _showMessage(error.message);
+      }
+    } catch (_) {
+      if (mounted) {
+        _showMessage('Could not update automatic fallback.');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _savingFallback = false;
+        });
+      }
+    }
   }
 
   Future<void> _saveProvider(String provider) async {
@@ -122,6 +184,46 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       if (mounted) {
         setState(() {
           _savingProvider = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _setPreferredProvider(String provider) async {
+    if (_savingPreferred || _savingProvider != null) {
+      return;
+    }
+
+    setState(() {
+      _savingPreferred = true;
+    });
+
+    try {
+      await ref
+          .read(assistantSettingsRepositoryProvider)
+          .savePreferredProvider(provider);
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _preferredProvider = provider;
+      });
+
+      _showMessage('${_label(provider)} is now the primary AI provider.');
+    } on ApiException catch (error) {
+      if (mounted) {
+        _showMessage(error.message);
+      }
+    } catch (_) {
+      if (mounted) {
+        _showMessage('Could not change the primary AI provider.');
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _savingPreferred = false;
         });
       }
     }
@@ -201,9 +303,37 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       case 'openrouter':
         return 'OpenRouter Free';
 
+      case 'cerebras':
+        return 'Cerebras';
+
+      case 'mistral':
+        return 'Mistral';
+
+      case 'nvidia':
+        return 'NVIDIA NIM';
+
       default:
         return provider;
     }
+  }
+
+  String _routingOrderText() {
+    const defaultOrder = <String>[
+      'gemini',
+      'groq',
+      'cloudflare',
+      'openrouter',
+      'cerebras',
+      'mistral',
+      'nvidia',
+    ];
+
+    final order = <String>[
+      _preferredProvider,
+      ...defaultOrder.where((provider) => provider != _preferredProvider),
+    ];
+
+    return order.map(_label).join(' > ');
   }
 
   void _showMessage(String message) {
@@ -243,108 +373,59 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  Widget _content(
-    AssistantSettingsData data,
-    ThemeMode themeMode,
-  ) {
-    final colors =
-        AppColors.of(context);
+  Widget _content(AssistantSettingsData data, ThemeMode themeMode) {
+    final colors = AppColors.of(context);
 
-    final selected =
-        data.provider(
-      _selectedProvider,
-    );
+    final selected = data.provider(_selectedProvider);
 
-    final configuredCount =
-        data.providers
-            .where(
-              (item) =>
-                  item.configured,
-            )
-            .length;
+    final configuredCount = data.providers
+        .where((item) => item.configured)
+        .length;
 
     return ListView(
-      physics:
-          const AlwaysScrollableScrollPhysics(),
-      padding:
-          const EdgeInsets.fromLTRB(
-        18,
-        16,
-        18,
-        40,
-      ),
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: const EdgeInsets.fromLTRB(18, 16, 18, 40),
       children: [
-
         // ==================================================
         // APPEARANCE
         // ==================================================
 
         Container(
-          padding:
-              const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 12,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: BoxDecoration(
+            color: colors.surface,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: colors.border),
           ),
-          decoration:
-              BoxDecoration(
-            color:
-                colors.surface,
-            borderRadius:
-                BorderRadius.circular(
-              16,
-            ),
-            border:
-                Border.all(
-              color:
-                  colors.border,
-            ),
-          ),
-          child:
-              Row(
+          child: Row(
             children: [
               Icon(
                 Icons.dark_mode_outlined,
-                size:
-                    21,
-                color:
-                    colors.textSecondary,
+                size: 21,
+                color: colors.textSecondary,
               ),
 
-              const SizedBox(
-                width:
-                    12,
-              ),
+              const SizedBox(width: 12),
 
               Expanded(
-                child:
-                    Column(
-                  crossAxisAlignment:
-                      CrossAxisAlignment.start,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Text(
                       'Dark mode',
-                      style:
-                          TextStyle(
-                        fontSize:
-                            13,
-                        fontWeight:
-                            FontWeight.w600,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
 
-                    const SizedBox(
-                      height:
-                          2,
-                    ),
+                    const SizedBox(height: 2),
 
                     Text(
                       'Use the dark app appearance',
-                      style:
-                          TextStyle(
-                        color:
-                            colors.textSecondary,
-                        fontSize:
-                            10,
+                      style: TextStyle(
+                        color: colors.textSecondary,
+                        fontSize: 10,
                       ),
                     ),
                   ],
@@ -352,314 +433,163 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               ),
 
               Switch(
-                value:
-                    themeMode ==
-                    ThemeMode.dark,
-                onChanged:
-                    (
-                  enabled,
-                ) {
+                value: themeMode == ThemeMode.dark,
+                onChanged: (enabled) {
                   ref
-                      .read(
-                        themeModeProvider
-                            .notifier,
-                      )
-                      .setMode(
-                        enabled
-                            ? ThemeMode.dark
-                            : ThemeMode.light,
-                      );
+                      .read(themeModeProvider.notifier)
+                      .setMode(enabled ? ThemeMode.dark : ThemeMode.light);
                 },
               ),
             ],
           ),
         ),
 
-        const SizedBox(
-          height:
-              28,
-        ),
+        const SizedBox(height: 28),
 
         // ==================================================
         // AI PROVIDER
         // ==================================================
-
         const Text(
           'AI Provider',
-          style:
-              TextStyle(
-            fontSize:
-                18,
-            fontWeight:
-                FontWeight.w700,
-          ),
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
         ),
 
-        const SizedBox(
-          height:
-              4,
-        ),
+        const SizedBox(height: 4),
 
         Text(
           'Select a provider and configure its API credentials.',
-          style:
-              TextStyle(
-            color:
-                colors.textSecondary,
-            fontSize:
-                11,
-          ),
+          style: TextStyle(color: colors.textSecondary, fontSize: 11),
         ),
 
-        const SizedBox(
-          height:
-              14,
-        ),
+        const SizedBox(height: 14),
 
         Container(
-          padding:
-              const EdgeInsets.all(
-            15,
+          padding: const EdgeInsets.all(15),
+          decoration: BoxDecoration(
+            color: colors.surface,
+            borderRadius: BorderRadius.circular(17),
+            border: Border.all(color: colors.border),
           ),
-          decoration:
-              BoxDecoration(
-            color:
-                colors.surface,
-            borderRadius:
-                BorderRadius.circular(
-              17,
-            ),
-            border:
-                Border.all(
-              color:
-                  colors.border,
-            ),
-          ),
-          child:
-              Column(
-            crossAxisAlignment:
-                CrossAxisAlignment.start,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-
               // ============================================
               // PROVIDER DROPDOWN
               // ============================================
 
               DropdownButtonFormField<String>(
-                isExpanded:
-                    true,
-                value:
-                    _selectedProvider,
-                decoration:
-                    InputDecoration(
-                  labelText:
-                      'Provider',
-                  prefixIcon:
-                      const Icon(
-                    Icons.smart_toy_outlined,
-                    size:
-                        20,
+                isExpanded: true,
+                initialValue: _selectedProvider,
+                decoration: InputDecoration(
+                  labelText: 'Provider',
+                  prefixIcon: const Icon(Icons.smart_toy_outlined, size: 20),
+                  filled: true,
+                  fillColor: colors.surfaceElevated,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 12,
                   ),
-                  filled:
-                      true,
-                  fillColor:
-                      colors.surfaceElevated,
-                  contentPadding:
-                      const EdgeInsets.symmetric(
-                    horizontal:
-                        12,
-                    vertical:
-                        12,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(13),
+                    borderSide: BorderSide(color: colors.border),
                   ),
-                  border:
-                      OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(
-                      13,
-                    ),
-                    borderSide:
-                        BorderSide(
-                      color:
-                          colors.border,
-                    ),
-                  ),
-                  enabledBorder:
-                      OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(
-                      13,
-                    ),
-                    borderSide:
-                        BorderSide(
-                      color:
-                          colors.border,
-                    ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(13),
+                    borderSide: BorderSide(color: colors.border),
                   ),
                 ),
-                items:
-                    data.providers
-                        .map(
-                  (
-                    item,
-                  ) {
-                    return DropdownMenuItem<
-                        String>(
-                      value:
-                          item.provider,
-                      child:
-                          Text(
-                        item.label,
-                      ),
-                    );
-                  },
-                ).toList(),
-                onChanged:
-                    _savingProvider !=
-                            null
-                        ? null
-                        : (
-                            value,
-                          ) {
-                            if (
-                              value ==
-                              null
-                            ) {
-                              return;
-                            }
+                items: data.providers.map((item) {
+                  return DropdownMenuItem<String>(
+                    value: item.provider,
+                    child: Text(item.label),
+                  );
+                }).toList(),
+                onChanged: _savingProvider != null
+                    ? null
+                    : (value) {
+                        if (value == null) {
+                          return;
+                        }
 
-                            setState(() {
-                              _selectedProvider =
-                                  value;
-                            });
-                          },
+                        setState(() {
+                          _selectedProvider = value;
+                        });
+                      },
               ),
 
-              if (
-                selected !=
-                null
-              ) ...[
-                const SizedBox(
-                  height:
-                      16,
-                ),
+              if (selected != null) ...[
+                const SizedBox(height: 16),
 
-                _selectedProviderCard(
-                  selected,
-                ),
+                _selectedProviderCard(selected),
               ],
 
-              const SizedBox(
-                height:
-                    16,
-              ),
+              const SizedBox(height: 16),
 
-              Divider(
-                height:
-                    1,
-                color:
-                    colors.border,
-              ),
+              Divider(height: 1, color: colors.border),
 
-              const SizedBox(
-                height:
-                    14,
-              ),
+              const SizedBox(height: 14),
 
               // ============================================
               // FALLBACK - COMPACT
               // ============================================
-
               Row(
                 children: [
                   Icon(
                     Icons.swap_horiz_rounded,
-                    size:
-                        18,
-                    color:
-                        colors.textSecondary,
+                    size: 18,
+                    color: colors.textSecondary,
                   ),
 
-                  const SizedBox(
-                    width:
-                        8,
-                  ),
+                  const SizedBox(width: 8),
 
                   const Expanded(
-                    child:
-                        Text(
+                    child: Text(
                       'Automatic fallback',
-                      style:
-                          TextStyle(
-                        fontSize:
-                            12,
-                        fontWeight:
-                            FontWeight.w600,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
                       ),
                     ),
                   ),
 
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(
-                      horizontal:
-                          9,
-                      vertical:
-                          4,
+                  Text(
+                    data.autoFallback ? 'ON' : 'OFF',
+                    style: TextStyle(
+                      color: data.autoFallback
+                          ? AppColors.green
+                          : colors.textMuted,
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
                     ),
-                    decoration:
-                        BoxDecoration(
-                      color:
-                          colors.surfaceElevated,
-                      borderRadius:
-                          BorderRadius.circular(
-                        20,
-                      ),
-                    ),
-                    child:
-                        const Text(
-                      'ON',
-                      style:
-                          TextStyle(
-                        fontSize:
-                            9,
-                        fontWeight:
-                            FontWeight.w700,
-                      ),
+                  ),
+
+                  const SizedBox(width: 4),
+
+                  Transform.scale(
+                    scale: 0.78,
+                    child: Switch.adaptive(
+                      value: data.autoFallback,
+                      onChanged: _savingFallback ? null : _setAutoFallback,
                     ),
                   ),
                 ],
               ),
 
-              const SizedBox(
-                height:
-                    7,
-              ),
+              const SizedBox(height: 7),
 
               Text(
-                'Gemini  >  Groq  >  Cloudflare  >  OpenRouter',
-                style:
-                    TextStyle(
-                  color:
-                      colors.textSecondary,
-                  fontSize:
-                      9.5,
-                ),
+                data.autoFallback
+                    ? _routingOrderText()
+                    : '${_label(_preferredProvider)} only',
+
+                style: TextStyle(color: colors.textSecondary, fontSize: 9.5),
               ),
 
-              const SizedBox(
-                height:
-                    5,
-              ),
+              const SizedBox(height: 5),
 
               Text(
                 '$configuredCount of ${data.providers.length} providers configured',
-                style:
-                    TextStyle(
-                  color:
-                      colors.textMuted,
-                  fontSize:
-                      9,
-                ),
+                style: TextStyle(color: colors.textMuted, fontSize: 9),
               ),
             ],
           ),
@@ -668,26 +598,16 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     );
   }
 
-  Widget _selectedProviderCard(
-    AssistantProviderSettings item,
-  ) {
-    final colors =
-        AppColors.of(context);
+  Widget _selectedProviderCard(AssistantProviderSettings item) {
+    final colors = AppColors.of(context);
 
-    final busy =
-        _savingProvider ==
-        item.provider;
+    final busy = _savingProvider == item.provider;
 
-    final controller =
-        _keyControllers[
-          item.provider
-        ]!;
+    final controller = _keyControllers[item.provider]!;
 
     return Column(
-      crossAxisAlignment:
-          CrossAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-
         // ================================================
         // STATUS
         // ================================================
@@ -695,305 +615,176 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         Row(
           children: [
             Icon(
-              item.configured
-                  ? Icons.check_circle
-                  : Icons.circle_outlined,
-              size:
-                  16,
-              color:
-                  item.configured
-                      ? AppColors.green
-                      : colors.textMuted,
+              item.configured ? Icons.check_circle : Icons.circle_outlined,
+              size: 16,
+              color: item.configured ? AppColors.green : colors.textMuted,
             ),
 
-            const SizedBox(
-              width:
-                  7,
-            ),
+            const SizedBox(width: 7),
 
             Text(
-              item.configured
-                  ? 'Configured'
-                  : 'Not configured',
-              style:
-                  TextStyle(
-                fontSize:
-                    11,
-                fontWeight:
-                    FontWeight.w600,
-                color:
-                    item.configured
-                        ? colors.textPrimary
-                        : colors.textMuted,
+              item.configured ? 'Configured' : 'Not configured',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: item.configured ? colors.textPrimary : colors.textMuted,
               ),
             ),
 
             const Spacer(),
 
-            if (
-              item.configured
-            ) ...[
+            if (item.configured) ...[
               Text(
-                item.keyHint ??
-                    '****',
-                style:
-                    TextStyle(
-                  color:
-                      colors.textSecondary,
-                  fontSize:
-                      10,
-                  fontWeight:
-                      FontWeight.w600,
+                item.keyHint ?? '****',
+                style: TextStyle(
+                  color: colors.textSecondary,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
 
-              const SizedBox(
-                width:
-                    3,
-              ),
+              const SizedBox(width: 3),
 
               IconButton(
-                tooltip:
-                    'Delete credentials',
-                visualDensity:
-                    VisualDensity.compact,
-                padding:
-                    EdgeInsets.zero,
-                constraints:
-                    const BoxConstraints(
-                  minWidth:
-                      30,
-                  minHeight:
-                      30,
-                ),
-                onPressed:
-                    _savingProvider !=
-                            null
-                        ? null
-                        : () =>
-                            _confirmDeleteProvider(
-                              item.provider,
-                            ),
-                icon:
-                    Icon(
+                tooltip: 'Delete credentials',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+                onPressed: _savingProvider != null
+                    ? null
+                    : () => _confirmDeleteProvider(item.provider),
+                icon: Icon(
                   Icons.delete_outline,
-                  size:
-                      16,
-                  color:
-                      Theme.of(
-                    context,
-                  )
-                          .colorScheme
-                          .error,
+                  size: 16,
+                  color: Theme.of(context).colorScheme.error,
                 ),
               ),
             ],
           ],
         ),
 
-        const SizedBox(
-          height:
-              3,
-        ),
+        const SizedBox(height: 3),
 
         Padding(
-          padding:
-              const EdgeInsets.only(
-            left:
-                23,
-          ),
-          child:
-              Text(
+          padding: const EdgeInsets.only(left: 23),
+          child: Text(
             item.model,
-            style:
-                TextStyle(
-              color:
-                  colors.textMuted,
-              fontSize:
-                  9,
-            ),
+            style: TextStyle(color: colors.textMuted, fontSize: 9),
           ),
         ),
 
-        if (
-          item.provider ==
-          'gemini'
-        ) ...[
-          const SizedBox(
-            height:
-                4,
-          ),
+        if (item.provider == 'gemini') ...[
+          const SizedBox(height: 4),
           Padding(
-            padding:
-                const EdgeInsets.only(
-              left:
-                  23,
-            ),
-            child:
-                Text(
+            padding: const EdgeInsets.only(left: 23),
+            child: Text(
               'Also used for Live Voice',
-              style:
-                  TextStyle(
-                color:
-                    colors.textMuted,
-                fontSize:
-                    9,
+              style: TextStyle(color: colors.textMuted, fontSize: 9),
+            ),
+          ),
+        ],
+
+        if (item.configured) ...[
+          const SizedBox(height: 12),
+
+          SizedBox(
+            width: double.infinity,
+            height: 40,
+            child: OutlinedButton.icon(
+              onPressed:
+                  _savingPreferred ||
+                      _savingProvider != null ||
+                      _preferredProvider == item.provider
+                  ? null
+                  : () => _setPreferredProvider(item.provider),
+              icon: Icon(
+                _preferredProvider == item.provider
+                    ? Icons.star_rounded
+                    : Icons.star_border_rounded,
+                size: 17,
+              ),
+              label: Text(
+                _preferredProvider == item.provider
+                    ? 'Primary provider'
+                    : 'Use as primary',
               ),
             ),
           ),
         ],
 
-        const SizedBox(
-          height:
-              14,
-        ),
+        const SizedBox(height: 14),
 
         // ================================================
         // CLOUDFLARE ACCOUNT ID
         // ================================================
-
-        if (
-          item.requiresAccountId
-        ) ...[
+        if (item.requiresAccountId) ...[
           TextField(
-            controller:
-                _cloudflareAccountController,
-            autocorrect:
-                false,
-            enableSuggestions:
-                false,
-            decoration:
-                InputDecoration(
-              hintText:
-                  item.accountId ==
-                          null
-                      ? 'Cloudflare Account ID'
-                      : 'Account ID: ${_accountHint(item.accountId!)}',
-              prefixIcon:
-                  const Icon(
-                Icons.badge_outlined,
-                size:
-                    20,
-              ),
-              filled:
-                  true,
-              fillColor:
-                  colors.surfaceElevated,
-              border:
-                  OutlineInputBorder(
-                borderRadius:
-                    BorderRadius.circular(
-                  13,
-                ),
+            controller: _cloudflareAccountController,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: InputDecoration(
+              hintText: item.accountId == null
+                  ? 'Cloudflare Account ID'
+                  : 'Account ID: ${_accountHint(item.accountId!)}',
+              prefixIcon: const Icon(Icons.badge_outlined, size: 20),
+              filled: true,
+              fillColor: colors.surfaceElevated,
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(13),
               ),
             ),
           ),
 
-          const SizedBox(
-            height:
-                10,
-          ),
+          const SizedBox(height: 10),
         ],
 
         // ================================================
         // API KEY
         // ================================================
-
         TextField(
-          controller:
-              controller,
-          obscureText:
-              _obscure[
-                    item.provider
-                  ] ??
-                  true,
-          autocorrect:
-              false,
-          enableSuggestions:
-              false,
-          decoration:
-              InputDecoration(
-            hintText:
-                item.configured
-                    ? 'Enter a new key to replace it'
-                    : 'Enter API key / token',
-            prefixIcon:
-                const Icon(
-              Icons.key_outlined,
-              size:
-                  20,
-            ),
-            suffixIcon:
-                IconButton(
-              onPressed:
-                  () {
+          controller: controller,
+          obscureText: _obscure[item.provider] ?? true,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            hintText: item.configured
+                ? 'Enter a new key to replace it'
+                : 'Enter API key / token',
+            prefixIcon: const Icon(Icons.key_outlined, size: 20),
+            suffixIcon: IconButton(
+              onPressed: () {
                 setState(() {
-                  _obscure[
-                    item.provider
-                  ] =
-                      !(
-                        _obscure[
-                              item.provider
-                            ] ??
-                            true
-                      );
+                  _obscure[item.provider] = !(_obscure[item.provider] ?? true);
                 });
               },
-              icon:
-                  Icon(
-                (
-                  _obscure[
-                        item.provider
-                      ] ??
-                      true
-                )
+              icon: Icon(
+                (_obscure[item.provider] ?? true)
                     ? Icons.visibility_outlined
                     : Icons.visibility_off_outlined,
-                size:
-                    20,
+                size: 20,
               ),
             ),
-            filled:
-                true,
-            fillColor:
-                colors.surfaceElevated,
-            border:
-                OutlineInputBorder(
-              borderRadius:
-                  BorderRadius.circular(
-                13,
-              ),
-            ),
+            filled: true,
+            fillColor: colors.surfaceElevated,
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(13)),
           ),
         ),
 
-        const SizedBox(
-          height:
-              11,
-        ),
+        const SizedBox(height: 11),
 
         SizedBox(
-          width:
-              double.infinity,
-          height:
-              44,
-          child:
-              FilledButton(
-            onPressed:
-                _savingProvider !=
-                        null
-                    ? null
-                    : () =>
-                        _saveProvider(
-                          item.provider,
-                        ),
-            child:
-                Text(
+          width: double.infinity,
+          height: 44,
+          child: FilledButton(
+            onPressed: _savingProvider != null
+                ? null
+                : () => _saveProvider(item.provider),
+            child: Text(
               busy
                   ? 'Checking...'
                   : item.configured
-                      ? 'Test & replace'
-                      : 'Test & save',
+                  ? 'Test & replace'
+                  : 'Test & save',
             ),
           ),
         ),
@@ -1028,74 +819,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           const SizedBox(height: 12),
 
           TextButton(onPressed: _reload, child: const Text('Try again')),
-        ],
-      ),
-    );
-  }
-}
-
-class _InfoCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final String value;
-  final Color valueColor;
-
-  const _InfoCard({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    required this.value,
-    required this.valueColor,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = AppColors.of(context);
-
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: colors.surface,
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: colors.border),
-      ),
-      child: Row(
-        children: [
-          Icon(icon, size: 20, color: colors.textSecondary),
-
-          const SizedBox(width: 12),
-
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-
-                const SizedBox(height: 2),
-
-                Text(
-                  subtitle,
-                  style: TextStyle(color: colors.textSecondary, fontSize: 10),
-                ),
-              ],
-            ),
-          ),
-
-          Text(
-            value,
-            style: TextStyle(
-              color: valueColor,
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
         ],
       ),
     );

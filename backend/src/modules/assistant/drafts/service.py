@@ -20,6 +20,7 @@ from src.modules.assistant.duplicate_matcher import (
     obvious_target,
 )
 from src.modules.assistant.drafts.repository import (
+    cancel_draft,
     claim_draft,
     find_draft,
     insert_draft,
@@ -377,6 +378,96 @@ def _evaluate_intent(intent, today_date):
                 )
 
     return preview
+
+
+def get_task_draft(draft_id):
+    """Return one existing draft using the normal public response shape."""
+
+    document = find_draft(draft_id)
+    if document is None:
+        raise AssistantDraftError(
+            "Assistant draft was not found or expired.",
+            404,
+        )
+    return _response(document)
+
+
+def create_task_draft_from_intent(
+    intent,
+    timezone_name="UTC",
+    provider="batch",
+    model="",
+    batch_id=None,
+    batch_index=None,
+):
+    """Create a server-owned draft from an already parsed CREATE intent.
+
+    This is the bridge used by multi-task batches. It deliberately does not
+    call an AI provider again. The existing deterministic preview engine owns
+    all missing-field questions, validation, duplicate checks and the final
+    review command.
+    """
+
+    if not isinstance(intent, dict) or intent.get("action") not in CREATE_ACTIONS:
+        raise AssistantDraftError(
+            "A supported create-task intent is required.",
+            400,
+        )
+
+    today = local_now(timezone_name).date()
+    evaluated = _evaluate_intent(
+        deepcopy(intent),
+        today.isoformat(),
+    )
+
+    question = evaluated.get("question")
+    question_field = (evaluated.get("missing_fields") or [None])[0]
+    now = _utc_now()
+
+    fields = {
+        "status": evaluated.get("status", "collecting"),
+        "intent": evaluated.get("intent", deepcopy(intent)),
+        "command": evaluated.get("command"),
+        "question": question,
+        "missing_fields": evaluated.get("missing_fields", []),
+        "validation_errors": evaluated.get("validation_errors", {}),
+        "duplicate_matches": evaluated.get("duplicate_matches", []),
+        "target_matches": evaluated.get("target_matches", []),
+        "selected_target_id": evaluated.get("selected_target_id"),
+        "suggestions": (
+            evaluated.get("suggestions", [])
+            if evaluated.get("status") == "needs_input"
+            else []
+        ),
+        "last_question_field": (
+            question_field
+            if evaluated.get("status") == "needs_input"
+            else None
+        ),
+        "last_question_text": (
+            question
+            if evaluated.get("status") == "needs_input"
+            else None
+        ),
+        "ask_count": 1,
+        "provider": provider or "batch",
+        "model": model or "",
+        "timezone": timezone_name,
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + DRAFT_TTL,
+        "executed_at": None,
+        "result": None,
+    }
+
+    if batch_id is not None:
+        fields["batch_id"] = str(batch_id)
+    if batch_index is not None:
+        fields["batch_index"] = int(batch_index)
+
+    inserted_id = insert_draft(fields)
+    fields["_id"] = inserted_id
+    return _response(fields)
 
 
 def preview_task_draft(
@@ -1037,6 +1128,62 @@ def _duplicate_update_command(draft, candidate_id):
     validate_executable_command(command)
     return command
 
+
+
+
+def cancel_task_draft(draft_id):
+    """Cancel a server-owned draft without executing its command.
+
+    Cancellation is idempotent for an already-cancelled draft, but it never
+    cancels an executing or executed draft.
+    """
+
+    draft = find_draft(draft_id)
+    if draft is None:
+        raise AssistantDraftError(
+            "Assistant draft was not found or expired.",
+            404,
+        )
+
+    status = draft.get("status")
+    if status == "cancelled":
+        return _response(draft)
+    if status in {"executing", "executed"}:
+        raise AssistantDraftError(
+            "An executing or executed draft cannot be cancelled.",
+            409,
+        )
+
+    allowed = {
+        "collecting",
+        "needs_input",
+        "needs_target_selection",
+        "ready",
+        "duplicate_review",
+    }
+
+    if status not in allowed:
+        raise AssistantDraftError(
+            "This assistant draft cannot be cancelled in its current state.",
+            409,
+        )
+
+    cancelled = cancel_draft(
+        draft_id,
+        allowed,
+        _utc_now(),
+    )
+
+    if cancelled is None:
+        latest = find_draft(draft_id)
+        if latest is not None and latest.get("status") == "cancelled":
+            return _response(latest)
+        raise AssistantDraftError(
+            "This assistant draft changed while it was being cancelled.",
+            409,
+        )
+
+    return _response(cancelled)
 
 def execute_task_draft(
     draft_id,

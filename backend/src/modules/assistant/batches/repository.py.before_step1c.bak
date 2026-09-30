@@ -1,0 +1,16 @@
+"""MongoDB repository for assistant multi-task batches."""
+
+from bson import ObjectId
+
+from src.config.db import get_db
+
+
+def insert_batch(document):
+    db = get_db()
+    result = db.assistant_task_batches.insert_one(document)
+    return result.inserted_id
+
+
+def find_batch(batch_id):
+    db = get_db()
+    return db.assistant_task_batches.find_one({"_id": ObjectId(batch_id)})

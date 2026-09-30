@@ -77,3 +77,23 @@ def release_claim(draft_id, status, updated_at, error_message=None):
         {"$set": fields},
         return_document=ReturnDocument.AFTER,
     )
+
+
+def cancel_draft(draft_id, allowed_statuses, cancelled_at):
+    """Atomically cancel a non-executing, non-executed draft."""
+
+    db = get_db()
+    return db.assistant_drafts.find_one_and_update(
+        {
+            "_id": ObjectId(draft_id),
+            "status": {"$in": list(allowed_statuses)},
+        },
+        {
+            "$set": {
+                "status": "cancelled",
+                "cancelled_at": cancelled_at,
+                "updated_at": cancelled_at,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )

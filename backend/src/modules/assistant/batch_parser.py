@@ -1,0 +1,173 @@
+"""Pure multi-task parser for assistant create requests.
+
+This module performs language -> ordered structured intents only. It has no
+MongoDB access and does not create, update, or execute task drafts.
+"""
+
+import json
+import time
+
+from src.modules.assistant.prompts.task_batch_prompt import TASK_BATCH_SYSTEM_PROMPT
+from src.modules.assistant.providers.provider_router import structured_json_with_fallback
+from src.modules.assistant.task_parser import (
+    _sanitize_task_fields,
+    _task_fields_schema,
+    local_now,
+)
+
+
+BATCH_CREATE_ACTIONS = {
+    "create_repeat_until_done_task",
+    "create_recurring_task",
+}
+
+MAX_BATCH_TASKS = 10
+
+TASK_BATCH_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tasks": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_BATCH_TASKS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": sorted(BATCH_CREATE_ACTIONS),
+                    },
+                    "task": _task_fields_schema(),
+                    "task_type_explicit": {
+                        "type": "boolean",
+                    },
+                },
+                "required": ["action", "task"],
+            },
+        }
+    },
+    "required": ["tasks"],
+}
+
+
+class TaskBatchParserError(Exception):
+    def __init__(self, message, status_code=400):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+def _sanitize_batch(value):
+    if not isinstance(value, dict):
+        raise TaskBatchParserError(
+            "AI provider did not return a JSON object for task extraction.",
+            502,
+        )
+
+    raw_tasks = value.get("tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise TaskBatchParserError(
+            "No task-create requests were extracted from the message.",
+            422,
+        )
+
+    if len(raw_tasks) > MAX_BATCH_TASKS:
+        raise TaskBatchParserError(
+            f"A maximum of {MAX_BATCH_TASKS} tasks can be created in one message.",
+            400,
+        )
+
+    intents = []
+    for index, item in enumerate(raw_tasks):
+        if not isinstance(item, dict):
+            raise TaskBatchParserError(
+                f"Task {index + 1} has an invalid structure.",
+                502,
+            )
+
+        action = item.get("action")
+        if action not in BATCH_CREATE_ACTIONS:
+            raise TaskBatchParserError(
+                f"Task {index + 1} is not a supported create action.",
+                422,
+            )
+
+        fields = _sanitize_task_fields(item.get("task"))
+
+        arguments = {"task": fields}
+
+        # The action selected by the language model is provisional unless
+        # the user explicitly stated the task type for this specific task.
+        # Preserve that distinction so the deterministic create flow asks
+        # only for genuinely missing information.
+        if item.get("task_type_explicit") is True:
+            arguments["collect"] = {
+                "task_type_confirmed": True,
+                "selected_task_action": action,
+            }
+
+        intents.append(
+            {
+                "action": action,
+                "arguments": arguments,
+            }
+        )
+
+    return intents
+
+
+def parse_task_batch_message(
+    message,
+    timezone_name="UTC",
+    api_key=None,
+    credentials=None,
+):
+    """Extract one or more ordered create intents from one user message.
+
+    Step 1 intentionally does NOT connect this parser to the existing draft
+    workflow. That happens only after this extraction layer is verified.
+    """
+
+    if not isinstance(message, str) or not message.strip():
+        raise TaskBatchParserError("message is required.", 400)
+
+    now = local_now(timezone_name)
+
+    user_prompt = (
+        f"TODAY: {now.date().isoformat()} ({now.strftime('%A')}), "
+        f"time {now.strftime('%H:%M')}, timezone {timezone_name}\n"
+        f"USER MESSAGE: {message.strip()}"
+    )
+
+    started = time.monotonic()
+    routed = structured_json_with_fallback(
+        message=user_prompt,
+        system_prompt=TASK_BATCH_SYSTEM_PROMPT,
+        response_schema=TASK_BATCH_RESPONSE_SCHEMA,
+        credentials=credentials,
+        api_key=api_key,
+    )
+
+    intents = _sanitize_batch(routed.get("result"))
+
+    print(
+        "[assistant] %s batch parse %.1fs -> %s"
+        % (
+            routed.get("provider", "unknown"),
+            time.monotonic() - started,
+            json.dumps(intents, ensure_ascii=False)[:800],
+        ),
+        flush=True,
+    )
+
+    return {
+        "provider": routed.get("provider", ""),
+        "type": routed.get("type", "api"),
+        "model": routed.get("model", ""),
+        "timezone": timezone_name,
+        "local_now": now,
+        "intents": intents,
+        "task_count": len(intents),
+        "fallback_used": bool(routed.get("fallback_used", False)),
+        "attempted_providers": routed.get("attempted_providers", []),
+    }

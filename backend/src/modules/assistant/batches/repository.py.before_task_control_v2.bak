@@ -1,0 +1,104 @@
+"""MongoDB repository for assistant multi-task batches."""
+
+from bson import ObjectId
+from pymongo import ReturnDocument
+
+from src.config.db import get_db
+
+
+def insert_batch(document):
+    db = get_db()
+    result = db.assistant_task_batches.insert_one(document)
+    return result.inserted_id
+
+
+def find_batch(batch_id):
+    db = get_db()
+    return db.assistant_task_batches.find_one({"_id": ObjectId(batch_id)})
+
+def attach_draft_to_active_item(
+    batch_id,
+    item_index,
+    draft_id,
+    updated_at,
+    expires_at,
+):
+    """Attach a draft once, only to the currently active batch item."""
+
+    db = get_db()
+    return db.assistant_task_batches.find_one_and_update(
+        {
+            "_id": ObjectId(batch_id),
+            "status": "in_progress",
+            "current_index": item_index,
+            "items": {
+                "$elemMatch": {
+                    "index": item_index,
+                    "status": "active",
+                    "draft_id": None,
+                }
+            },
+        },
+        {
+            "$set": {
+                "items.$.draft_id": str(draft_id),
+                "updated_at": updated_at,
+                "expires_at": expires_at,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def resolve_active_item_and_advance(
+    batch_id,
+    item_index,
+    draft_id,
+    resolved_status,
+    resolved_at,
+    expires_at,
+    has_next,
+    result=None,
+):
+    """Atomically resolve the current item and activate the next one.
+
+    The batch document is the sequencing authority. The filter guarantees that
+    only the still-active item at current_index can be resolved. This prevents
+    retries from skipping multiple tasks.
+    """
+
+    db = get_db()
+
+    if resolved_status not in {"executed", "skipped"}:
+        raise ValueError("resolved_status must be executed or skipped")
+
+    set_fields = {
+        f"items.{item_index}.status": resolved_status,
+        f"items.{item_index}.resolved_at": resolved_at,
+        "updated_at": resolved_at,
+        "expires_at": expires_at,
+    }
+
+    if result is not None:
+        set_fields[f"items.{item_index}.result"] = result
+
+    next_index = item_index + 1
+
+    if has_next:
+        set_fields["current_index"] = next_index
+        set_fields[f"items.{next_index}.status"] = "active"
+    else:
+        set_fields["status"] = "completed"
+        set_fields["current_index"] = None
+
+    return db.assistant_task_batches.find_one_and_update(
+        {
+            "_id": ObjectId(batch_id),
+            "status": "in_progress",
+            "current_index": item_index,
+            f"items.{item_index}.status": "active",
+            f"items.{item_index}.draft_id": str(draft_id),
+        },
+        {"$set": set_fields},
+        return_document=ReturnDocument.AFTER,
+    )

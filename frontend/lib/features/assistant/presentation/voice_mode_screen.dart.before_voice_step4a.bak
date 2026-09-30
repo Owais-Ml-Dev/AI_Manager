@@ -11,7 +11,6 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import '../../../core/theme/app_colors.dart';
 import '../application/assistant_providers.dart';
 import 'widgets/voice_orb.dart';
-import '../data/assistant_batch_session_store.dart';
 import '../data/assistant_repository.dart';
 import '../domain/assistant_intent.dart';
 import '../../home/application/home_providers.dart';
@@ -92,22 +91,9 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
   // TASK WORKFLOW
   // =========================================================
 
-  final AssistantBatchSessionStore _batchSessionStore =
-      const AssistantBatchSessionStore();
-
-  String? _taskBatchId;
-
-  int? _taskBatchCurrentTaskNumber;
-
-  int? _taskBatchTotalTasks;
-
   String? _taskDraftId;
 
   AssistantCommandPreview? _pendingTaskPreview;
-
-  ActiveTaskControlIntent? _pendingVoiceTaskControlIntent;
-
-  String? _voiceTaskResumePrompt;
 
   Timer? _taskTranscriptTimer;
 
@@ -477,9 +463,7 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
   // =========================================================
 
   bool get _taskFlowActive {
-    return _taskBatchId != null ||
-        _taskDraftId != null ||
-        _pendingTaskPreview != null;
+    return _taskDraftId != null || _pendingTaskPreview != null;
   }
 
   void _acceptFinalInputTranscription(String incoming) {
@@ -635,431 +619,10 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
     return cancellations.contains(text);
   }
 
-  String _voiceTaskProgress() {
-    final current = _taskBatchCurrentTaskNumber;
-    final total = _taskBatchTotalTasks;
-
-    if (_taskBatchId == null ||
-        current == null ||
-        total == null ||
-        current < 1 ||
-        total < 1) {
-      return '';
-    }
-
-    return 'Task $current of $total.';
-  }
-
-  String _voiceTaskSpeech(String body, {String? lead}) {
-    final parts = <String>[];
-
-    final cleanLead = lead?.trim();
-    if (cleanLead != null && cleanLead.isNotEmpty) {
-      parts.add(cleanLead);
-    }
-
-    final progress = _voiceTaskProgress();
-    if (progress.isNotEmpty) {
-      parts.add(progress);
-    }
-
-    final cleanBody = body.trim();
-    if (cleanBody.isNotEmpty) {
-      parts.add(cleanBody);
-    }
-
-    return parts.join(' ');
-  }
-
-  void _applyVoiceBatchActive(AssistantTaskBatchActiveResult active) {
-    _taskBatchId = active.batchId;
-    _taskBatchCurrentTaskNumber = active.currentTaskNumber;
-    _taskBatchTotalTasks = active.totalTasks;
-    _taskDraftId = active.activeDraft.draftId;
-    _pendingTaskPreview = null;
-  }
-
-  Future<void> _rememberVoiceBatch(String batchId) async {
-    try {
-      await _batchSessionStore.saveActiveBatchId(batchId);
-    } catch (error) {
-      debugPrint('[VOICE TASK] Could not persist batch id: $error');
-    }
-  }
-
-  Future<void> _forgetVoiceBatch() async {
-    try {
-      await _batchSessionStore.clearActiveBatchId();
-    } catch (error) {
-      debugPrint('[VOICE TASK] Could not clear batch id: $error');
-    }
-  }
-
-  Future<void> _startVoiceTaskBatch(String utterance) async {
-    final batch = await ref
-        .read(assistantRepositoryProvider)
-        .startTaskBatch(utterance);
-
-    _taskBatchId = batch.batchId;
-    _taskBatchCurrentTaskNumber = batch.currentTaskNumber;
-    _taskBatchTotalTasks = batch.totalTasks;
-    _taskDraftId = batch.activeDraft.draftId;
-    _pendingTaskPreview = null;
-
-    await _rememberVoiceBatch(batch.batchId);
-    await _handleTaskPreview(batch.activeDraft);
-  }
-
-  Future<void> _continueVoiceTaskBatch(String utterance) async {
-    final batchId = _taskBatchId;
-    if (batchId == null) {
-      return;
-    }
-
-    final active = await ref
-        .read(assistantRepositoryProvider)
-        .continueTaskBatch(batchId: batchId, message: utterance);
-
-    _applyVoiceBatchActive(active);
-    await _handleTaskPreview(active.activeDraft);
-  }
-
-  Future<AssistantTaskBatchActiveResult?> _recoverNextVoiceBatchTask(
-    String batchId,
-  ) async {
-    try {
-      return await ref
-          .read(assistantRepositoryProvider)
-          .getActiveTaskBatch(batchId);
-    } catch (error) {
-      debugPrint('[VOICE TASK] Could not recover next batch task: $error');
-      return null;
-    }
-  }
-
-  Future<void> _handleVoiceBatchResolution(
-    AssistantTaskBatchResolutionResult resolution, {
-    String? lead,
-  }) async {
-    final total = resolution.totalTasks > 0
-        ? resolution.totalTasks
-        : (_taskBatchTotalTasks ?? 0);
-    final resolvedNumber = resolution.resolvedTaskNumber;
-
-    if (resolution.allDone || resolution.batchStatus == 'completed') {
-      await _forgetVoiceBatch();
-      _clearTaskFlow();
-
-      final doneLead = lead?.trim().isNotEmpty == true
-          ? lead!.trim()
-          : 'Saved Task $resolvedNumber of $total.';
-
-      await _speakBackendText(
-        '$doneLead Batch complete. '
-        '$total of $total task requests reviewed.',
-      );
-      return;
-    }
-
-    var next = resolution.nextTask;
-
-    if (next == null && resolution.batchId.isNotEmpty) {
-      next = await _recoverNextVoiceBatchTask(resolution.batchId);
-    }
-
-    if (next == null) {
-      _taskDraftId = null;
-      _pendingTaskPreview = null;
-      _taskBatchCurrentTaskNumber = resolution.currentTaskNumber;
-
-      final savedLead = lead?.trim().isNotEmpty == true
-          ? lead!.trim()
-          : 'Saved Task $resolvedNumber of $total.';
-
-      await _speakBackendText(
-        '$savedLead The next task is still saved in the batch, '
-        'but I could not load it right now. '
-        'Open the text Assistant to recover the unfinished batch.',
-      );
-      return;
-    }
-
-    _applyVoiceBatchActive(next);
-
-    final savedLead = lead?.trim().isNotEmpty == true
-        ? lead!.trim()
-        : 'Saved Task $resolvedNumber of $total.';
-
-    await _handleTaskPreview(next.activeDraft, lead: savedLead);
-  }
-
-  bool _isContinueTaskSpeech(String value) {
-    final text = _normalizeTaskSpeech(value);
-
-    const phrases = <String>{
-      'continue',
-      'continue task',
-      'continue the task',
-      'keep task',
-      'keep the task',
-      'keep tasks',
-      'keep the tasks',
-      'resume',
-      'resume task',
-      'go back',
-      'no',
-      'no keep it',
-      'dont skip',
-      'do not skip',
-      'dont discard',
-      'do not discard',
-    };
-
-    return phrases.contains(text) ||
-        text.startsWith('continue ') ||
-        text.startsWith('keep ');
-  }
-
-  ActiveTaskControlIntent _voiceControlSelection(String value) {
-    final detected = detectActiveTaskControlIntent(value);
-    if (detected != ActiveTaskControlIntent.none &&
-        detected != ActiveTaskControlIntent.ambiguousStop) {
-      return detected;
-    }
-
-    final text = _normalizeTaskSpeech(value);
-
-    if (RegExp(r'\bskip\b').hasMatch(text)) {
-      return ActiveTaskControlIntent.skipCurrent;
-    }
-
-    if (RegExp(r'\b(discard|delete|drop|remove|abort|cancel)\b')
-        .hasMatch(text)) {
-      if (RegExp(r'\b(all|remaining|rest|everything|batch)\b').hasMatch(text)) {
-        return ActiveTaskControlIntent.discardRemaining;
-      }
-
-      if (RegExp(r'\b(current|this|task|one)\b').hasMatch(text)) {
-        return ActiveTaskControlIntent.discardCurrent;
-      }
-    }
-
-    if (RegExp(r'\b(start|create|make)\b.*\b(new|another)\b.*\btask\b')
-        .hasMatch(text)) {
-      return ActiveTaskControlIntent.startNewTask;
-    }
-
-    return ActiveTaskControlIntent.none;
-  }
-
-  String _voiceControlPrompt(ActiveTaskControlIntent intent) {
-    final current = _taskBatchCurrentTaskNumber ?? 1;
-    final total = _taskBatchTotalTasks ?? current;
-
-    switch (intent) {
-      case ActiveTaskControlIntent.skipCurrent:
-        if (total <= 1) {
-          return 'Do you want to skip Task $current? '
-              'Say yes to skip it, or say continue to keep working on it.';
-        }
-        return 'Do you want to skip Task $current for now? '
-            'I will return to it after the other unfinished tasks. '
-            'Say yes to skip it for now, or say continue to keep working on it.';
-
-      case ActiveTaskControlIntent.discardCurrent:
-        return 'Do you want to discard Task $current? '
-            'This task will not return later. '
-            'Say yes to discard it, or say continue to keep it.';
-
-      case ActiveTaskControlIntent.discardRemaining:
-        return 'Do you want to discard all unfinished tasks in this batch? '
-            'Tasks already saved will not be changed. '
-            'Say yes to discard the unfinished tasks, or say continue to keep them.';
-
-      case ActiveTaskControlIntent.startNewTask:
-        return 'You still have an unfinished task batch. '
-            'Do you want to discard all unfinished tasks and start a new task? '
-            'Tasks already saved will not be changed. '
-            'Say yes to discard them and start new, or say keep tasks.';
-
-      case ActiveTaskControlIntent.ambiguousStop:
-        return 'What would you like to do? '
-            'Say continue task, skip current task, discard current task, '
-            'or discard remaining tasks.';
-
-      case ActiveTaskControlIntent.none:
-        return 'Please continue with the current task.';
-    }
-  }
-
-  Future<void> _beginVoiceTaskControl(ActiveTaskControlIntent intent) async {
-    if (_taskBatchId == null) {
-      return;
-    }
-
-    // Snapshot the last task question/review text before the control prompt
-    // replaces the visible/spoken assistant transcript.
-    final previous = _assistantTranscript.trim();
-    if (_pendingVoiceTaskControlIntent == null && previous.isNotEmpty) {
-      _voiceTaskResumePrompt = previous;
-    }
-
-    _pendingVoiceTaskControlIntent = intent;
-    await _speakBackendText(_voiceControlPrompt(intent));
-  }
-
-  Future<void> _resumeVoiceTaskAfterControl() async {
-    _pendingVoiceTaskControlIntent = null;
-
-    final progress = _voiceTaskProgress();
-    final previous = _voiceTaskResumePrompt?.trim();
-    _voiceTaskResumePrompt = null;
-
-    final parts = <String>[];
-    if (progress.isNotEmpty) {
-      parts.add('Continuing $progress');
-    } else {
-      parts.add('Continuing the current task.');
-    }
-
-    if (previous != null && previous.isNotEmpty) {
-      parts.add(previous);
-    } else {
-      parts.add('Please continue with the current task.');
-    }
-
-    await _speakBackendText(parts.join(' '));
-  }
-
-  Future<void> _executeVoiceTaskControl(ActiveTaskControlIntent intent) async {
-    final batchId = _taskBatchId;
-    final draftId = _taskDraftId;
-
-    if (batchId == null || draftId == null) {
-      _pendingVoiceTaskControlIntent = null;
-      _voiceTaskResumePrompt = null;
-      await _speakBackendText(
-        'I could not find an active task to change. Please try again.',
-      );
-      return;
-    }
-
-    _pendingVoiceTaskControlIntent = null;
-    _voiceTaskResumePrompt = null;
-
-    switch (intent) {
-      case ActiveTaskControlIntent.skipCurrent:
-        final total = _taskBatchTotalTasks ?? 1;
-        final resolution = total <= 1
-            ? await ref
-                  .read(assistantRepositoryProvider)
-                  .cancelTaskBatch(batchId: batchId, draftId: draftId)
-            : await ref
-                  .read(assistantRepositoryProvider)
-                  .deferTaskBatch(batchId: batchId, draftId: draftId);
-
-        await _handleVoiceBatchResolution(
-          resolution,
-          lead: total <= 1
-              ? 'Skipped Task ${resolution.resolvedTaskNumber}. '
-                    'No task was created from it.'
-              : 'Skipped Task ${resolution.resolvedTaskNumber} for now. '
-                    'I will return to it after the other unfinished tasks.',
-        );
-        return;
-
-      case ActiveTaskControlIntent.discardCurrent:
-        final resolution = await ref
-            .read(assistantRepositoryProvider)
-            .cancelTaskBatch(batchId: batchId, draftId: draftId);
-
-        await _handleVoiceBatchResolution(
-          resolution,
-          lead:
-              'Discarded Task ${resolution.resolvedTaskNumber}. '
-              'No task was created from it.',
-        );
-        return;
-
-      case ActiveTaskControlIntent.discardRemaining:
-      case ActiveTaskControlIntent.startNewTask:
-        await ref
-            .read(assistantRepositoryProvider)
-            .abortTaskBatch(batchId: batchId, draftId: draftId);
-
-        await _forgetVoiceBatch();
-        final startNew = intent == ActiveTaskControlIntent.startNewTask;
-        _clearTaskFlow();
-
-        await _speakBackendText(
-          startNew
-              ? 'Discarded all unfinished tasks in the previous batch. '
-                    'Tasks already saved were not changed. '
-                    'What new task would you like to create?'
-              : 'Discarded all unfinished tasks in this batch. '
-                    'Tasks already saved were not changed.',
-        );
-        return;
-
-      case ActiveTaskControlIntent.ambiguousStop:
-      case ActiveTaskControlIntent.none:
-        await _speakBackendText(
-          'No task changes were made. Please continue with the current task.',
-        );
-        return;
-    }
-  }
-
-  Future<void> _handlePendingVoiceTaskControl(String utterance) async {
-    final pending = _pendingVoiceTaskControlIntent;
-    if (pending == null) {
-      return;
-    }
-
-    // "continue", "keep it", or "no" always means cancel the pending
-    // control operation and return to the exact task flow.
-    if (_isContinueTaskSpeech(utterance) ||
-        (pending != ActiveTaskControlIntent.ambiguousStop &&
-            _isCancelSpeech(utterance))) {
-      await _resumeVoiceTaskAfterControl();
-      return;
-    }
-
-    // The ambiguous menu first requires the user to choose an action. Choosing
-    // an action does not mutate anything; it opens the specific confirmation.
-    if (pending == ActiveTaskControlIntent.ambiguousStop) {
-      final selected = _voiceControlSelection(utterance);
-
-      if (selected == ActiveTaskControlIntent.none ||
-          selected == ActiveTaskControlIntent.ambiguousStop) {
-        await _speakBackendText(_voiceControlPrompt(pending));
-        return;
-      }
-
-      await _beginVoiceTaskControl(selected);
-      return;
-    }
-
-    // A clear destructive/skip intent still requires an explicit yes/confirm.
-    if (_isConfirmSpeech(utterance)) {
-      await _executeVoiceTaskControl(pending);
-      return;
-    }
-
-    // If the user changes their mind to another control action, switch the
-    // confirmation target but still do not mutate yet.
-    final selected = _voiceControlSelection(utterance);
-    if (selected != ActiveTaskControlIntent.none && selected != pending) {
-      await _beginVoiceTaskControl(selected);
-      return;
-    }
-
-    await _speakBackendText(_voiceControlPrompt(pending));
-  }
-
   Future<void> _processTaskUtterance(String utterance) async {
     if (_processingTask) {
       _queuedTaskUtterance = utterance;
+
       return;
     }
 
@@ -1067,52 +630,29 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
 
     try {
       // -----------------------------------------------------
-      // PENDING VOICE TASK-CONTROL CONFIRMATION
+      // CANCEL AT ANY STAGE
       // -----------------------------------------------------
-      if (_pendingVoiceTaskControlIntent != null) {
-        await _handlePendingVoiceTaskControl(utterance);
-        return;
-      }
 
-      // -----------------------------------------------------
-      // ACTIVE BATCH TASK-CONTROL INTENT
-      // -----------------------------------------------------
-      // This MUST run before the current task answer is sent to /continue.
-      // Clear destructive/skip requests open confirmation; generic cancel/stop
-      // opens an action menu. No backend mutation happens here.
-      if (_taskBatchId != null) {
-        final controlIntent = detectActiveTaskControlIntent(utterance);
-        if (controlIntent != ActiveTaskControlIntent.none) {
-          await _beginVoiceTaskControl(controlIntent);
-          return;
-        }
-      }
-
-      // -----------------------------------------------------
-      // LEGACY STANDALONE CANCEL / STOP
-      // -----------------------------------------------------
-      // Update/delete/complete single-command voice flows retain their old
-      // cancel behavior. Batch creates use the explicit control flow above.
-      if (_taskBatchId == null &&
-          _taskFlowActive &&
-          _isCancelSpeech(utterance)) {
+      if (_taskFlowActive && _isCancelSpeech(utterance)) {
         _clearTaskFlow();
+
         await _speakBackendText('Cancelled. No changes were made.');
+
         return;
       }
 
       final pending = _pendingTaskPreview;
 
       // -----------------------------------------------------
-      // TARGET SELECTION (standalone update/delete flow)
+      // TARGET SELECTION
       // -----------------------------------------------------
+
       if (pending != null && pending.needsTargetSelection) {
         final match = _resolveTaskMatch(pending.targetMatches, utterance);
 
         if (match == null) {
-          await _speakBackendText(
-            _voiceTaskSpeech(_targetSelectionPrompt(pending)),
-          );
+          await _speakBackendText(_targetSelectionPrompt(pending));
+
           return;
         }
 
@@ -1121,68 +661,64 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
             .selectTaskTarget(draftId: pending.draftId, taskId: match.id);
 
         _taskDraftId = resolved.draftId;
+
         _pendingTaskPreview = null;
+
         await _handleTaskPreview(resolved);
+
         return;
       }
 
       // -----------------------------------------------------
       // DUPLICATE REVIEW
       // -----------------------------------------------------
+
       if (pending != null && pending.duplicateReview) {
         await _handleDuplicateSpeech(pending, utterance);
+
         return;
       }
 
       // -----------------------------------------------------
       // FINAL CONFIRMATION
       // -----------------------------------------------------
+
       if (pending != null &&
           pending.ready &&
           pending.action != 'list_active_tasks') {
         if (_isConfirmSpeech(utterance)) {
           await _executeConfirmedTask(pending);
+
           return;
         }
 
-        final message = _taskBatchId != null
-            ? '${pending.summary}. Say confirm to save this task.'
-            : 'The task change is ready. '
-                  '${pending.summary}. '
-                  'Say confirm to continue, '
-                  'or cancel to make no changes.';
+        await _speakBackendText(
+          'The task change is ready. '
+          '${pending.summary}. '
+          'Say confirm to continue, '
+          'or cancel to make no changes.',
+        );
 
-        await _speakBackendText(_voiceTaskSpeech(message));
         return;
       }
 
       // -----------------------------------------------------
-      // ANSWER TO ACTIVE BATCH TASK
+      // NEW TASK COMMAND OR ANSWER TO NEEDS_INPUT
       // -----------------------------------------------------
-      if (_taskBatchId != null) {
-        await _continueVoiceTaskBatch(utterance);
-        return;
-      }
 
-      // -----------------------------------------------------
-      // NEW CREATE REQUEST -> SERVER-OWNED BATCH
-      // -----------------------------------------------------
-      if (_taskDraftId == null && looksLikeCreateTaskAction(utterance)) {
-        await _startVoiceTaskBatch(utterance);
-        return;
-      }
-
-      // -----------------------------------------------------
-      // EXISTING SINGLE-COMMAND FLOW
-      // -----------------------------------------------------
       final preview = await ref
           .read(assistantRepositoryProvider)
           .previewTaskCommand(utterance, draftId: _taskDraftId);
 
       _taskDraftId = preview.draftId;
+
       await _handleTaskPreview(preview);
     } catch (error, stackTrace) {
-      debugPrint('[VOICE TASK] Error: $error');
+      debugPrint(
+        '[VOICE TASK] Error: '
+        '$error',
+      );
+
       debugPrint('$stackTrace');
 
       await _speakBackendText(
@@ -1193,6 +729,7 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
       _processingTask = false;
 
       final queued = _queuedTaskUtterance;
+
       _queuedTaskUtterance = null;
 
       if (queued != null && queued.trim().isNotEmpty) {
@@ -1201,10 +738,7 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
     }
   }
 
-  Future<void> _handleTaskPreview(
-    AssistantCommandPreview preview, {
-    String? lead,
-  }) async {
+  Future<void> _handleTaskPreview(AssistantCommandPreview preview) async {
     if (preview.draftId.isNotEmpty) {
       _taskDraftId = preview.draftId;
     }
@@ -1212,46 +746,51 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
     // -------------------------------------------------------
     // BACKEND NEEDS AN ANSWER
     // -------------------------------------------------------
+
     if (preview.needsInput) {
       _pendingTaskPreview = null;
 
       var question = preview.question ?? 'I need a little more information.';
 
       if (preview.suggestions.isNotEmpty) {
-        question += ' Options include ${preview.suggestions.join(', ')}.';
+        question +=
+            ' Options include '
+            '${preview.suggestions.join(', ')}.';
       }
 
-      await _speakBackendText(_voiceTaskSpeech(question, lead: lead));
+      await _speakBackendText(question);
+
       return;
     }
 
     // -------------------------------------------------------
     // USER MUST SELECT MATCHING TASK
     // -------------------------------------------------------
+
     if (preview.needsTargetSelection) {
       _pendingTaskPreview = preview;
 
-      await _speakBackendText(
-        _voiceTaskSpeech(_targetSelectionPrompt(preview), lead: lead),
-      );
+      await _speakBackendText(_targetSelectionPrompt(preview));
+
       return;
     }
 
     // -------------------------------------------------------
     // DUPLICATE TASK REVIEW
     // -------------------------------------------------------
+
     if (preview.duplicateReview) {
       _pendingTaskPreview = preview;
 
-      await _speakBackendText(
-        _voiceTaskSpeech(_duplicatePrompt(preview), lead: lead),
-      );
+      await _speakBackendText(_duplicatePrompt(preview));
+
       return;
     }
 
     // -------------------------------------------------------
     // READY
     // -------------------------------------------------------
+
     if (preview.ready) {
       if (preview.action == 'list_active_tasks') {
         final response = await ref
@@ -1259,33 +798,33 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
             .executeTaskCommand(draftId: preview.draftId, confirmed: false);
 
         final spoken = _formatReadOnlyTasks(response);
+
         _clearTaskFlow();
+
         await _speakBackendText(spoken);
+
         return;
       }
 
-      // Never mutate immediately. Every task is individually confirmed.
+      // Never mutate immediately.
+      // Voice must still ask for confirmation.
       _pendingTaskPreview = preview;
 
       final summary = preview.summary.isEmpty
           ? 'The task change is ready.'
           : preview.summary;
 
-      final body = _taskBatchId != null
-          ? '$summary. Say confirm to save this task.'
-          : '$summary. '
-                'Say confirm to continue, '
-                'or cancel to make no changes.';
+      await _speakBackendText(
+        '$summary. '
+        'Say confirm to continue, '
+        'or cancel to make no changes.',
+      );
 
-      await _speakBackendText(_voiceTaskSpeech(body, lead: lead));
       return;
     }
 
     await _speakBackendText(
-      _voiceTaskSpeech(
-        preview.question ?? 'I could not determine the next task step.',
-        lead: lead,
-      ),
+      preview.question ?? 'I could not determine the next task step.',
     );
   }
 
@@ -1400,30 +939,10 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
     String utterance,
   ) async {
     final normalized = _normalizeTaskSpeech(utterance);
-    final batchId = _taskBatchId;
 
     if (normalized.contains('create new') ||
         normalized.contains('create anyway') ||
         normalized == 'new') {
-      if (batchId != null) {
-        final resolution = await ref
-            .read(assistantRepositoryProvider)
-            .confirmTaskBatch(
-              batchId: batchId,
-              draftId: preview.draftId,
-              duplicateDecision: 'create_new',
-            );
-
-        _refreshTaskScreens();
-        await _handleVoiceBatchResolution(
-          resolution,
-          lead:
-              'Saved Task ${resolution.resolvedTaskNumber} '
-              'of ${resolution.totalTasks}.',
-        );
-        return;
-      }
-
       await ref
           .read(assistantRepositoryProvider)
           .executeTaskCommand(
@@ -1436,10 +955,13 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
 
       final summary = preview.summary.isEmpty
           ? 'Task created.'
-          : 'Done. ${preview.summary}';
+          : ('Done. '
+                '${preview.summary}');
 
       _clearTaskFlow();
+
       await _speakBackendText(summary);
+
       return;
     }
 
@@ -1459,28 +981,8 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
               : null);
 
       if (candidate == null) {
-        await _speakBackendText(_voiceTaskSpeech(_duplicatePrompt(preview)));
-        return;
-      }
+        await _speakBackendText(_duplicatePrompt(preview));
 
-      if (batchId != null) {
-        final resolution = await ref
-            .read(assistantRepositoryProvider)
-            .confirmTaskBatch(
-              batchId: batchId,
-              draftId: preview.draftId,
-              duplicateDecision: 'update_existing',
-              candidateId: candidate.id,
-            );
-
-        _refreshTaskScreens();
-        await _handleVoiceBatchResolution(
-          resolution,
-          lead:
-              'Used the existing task ${candidate.title} '
-              'for Task ${resolution.resolvedTaskNumber} '
-              'of ${resolution.totalTasks}.',
-        );
         return;
       }
 
@@ -1494,38 +996,21 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
           );
 
       _refreshTaskScreens();
+
       _clearTaskFlow();
 
       await _speakBackendText(
-        'Done. The existing task ${candidate.title} was used.',
+        'Done. The existing task '
+        '${candidate.title} was used.',
       );
+
       return;
     }
 
-    await _speakBackendText(_voiceTaskSpeech(_duplicatePrompt(preview)));
+    await _speakBackendText(_duplicatePrompt(preview));
   }
 
   Future<void> _executeConfirmedTask(AssistantCommandPreview preview) async {
-    final batchId = _taskBatchId;
-
-    if (batchId != null) {
-      final resolution = await ref
-          .read(assistantRepositoryProvider)
-          .confirmTaskBatch(batchId: batchId, draftId: preview.draftId);
-
-      _refreshTaskScreens();
-
-      final summary = preview.summary.trim();
-      final lead = summary.isEmpty
-          ? 'Saved Task ${resolution.resolvedTaskNumber} '
-                'of ${resolution.totalTasks}.'
-          : 'Saved Task ${resolution.resolvedTaskNumber} '
-                'of ${resolution.totalTasks}. $summary.';
-
-      await _handleVoiceBatchResolution(resolution, lead: lead);
-      return;
-    }
-
     await ref
         .read(assistantRepositoryProvider)
         .executeTaskCommand(draftId: preview.draftId, confirmed: true);
@@ -1534,20 +1019,19 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
 
     final summary = preview.summary.isEmpty
         ? 'The task change was completed.'
-        : 'Done. ${preview.summary}';
+        : ('Done. '
+              '${preview.summary}');
 
     _clearTaskFlow();
+
     await _speakBackendText(summary);
   }
 
   void _clearTaskFlow() {
-    _taskBatchId = null;
-    _taskBatchCurrentTaskNumber = null;
-    _taskBatchTotalTasks = null;
     _taskDraftId = null;
+
     _pendingTaskPreview = null;
-    _pendingVoiceTaskControlIntent = null;
-    _voiceTaskResumePrompt = null;
+
     _queuedTaskUtterance = null;
   }
 

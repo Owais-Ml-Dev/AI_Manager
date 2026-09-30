@@ -105,10 +105,6 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
 
   AssistantCommandPreview? _pendingTaskPreview;
 
-  ActiveTaskControlIntent? _pendingVoiceTaskControlIntent;
-
-  String? _voiceTaskResumePrompt;
-
   Timer? _taskTranscriptTimer;
 
   String _taskTranscriptBuffer = '';
@@ -793,270 +789,6 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
     await _handleTaskPreview(next.activeDraft, lead: savedLead);
   }
 
-  bool _isContinueTaskSpeech(String value) {
-    final text = _normalizeTaskSpeech(value);
-
-    const phrases = <String>{
-      'continue',
-      'continue task',
-      'continue the task',
-      'keep task',
-      'keep the task',
-      'keep tasks',
-      'keep the tasks',
-      'resume',
-      'resume task',
-      'go back',
-      'no',
-      'no keep it',
-      'dont skip',
-      'do not skip',
-      'dont discard',
-      'do not discard',
-    };
-
-    return phrases.contains(text) ||
-        text.startsWith('continue ') ||
-        text.startsWith('keep ');
-  }
-
-  ActiveTaskControlIntent _voiceControlSelection(String value) {
-    final detected = detectActiveTaskControlIntent(value);
-    if (detected != ActiveTaskControlIntent.none &&
-        detected != ActiveTaskControlIntent.ambiguousStop) {
-      return detected;
-    }
-
-    final text = _normalizeTaskSpeech(value);
-
-    if (RegExp(r'\bskip\b').hasMatch(text)) {
-      return ActiveTaskControlIntent.skipCurrent;
-    }
-
-    if (RegExp(r'\b(discard|delete|drop|remove|abort|cancel)\b')
-        .hasMatch(text)) {
-      if (RegExp(r'\b(all|remaining|rest|everything|batch)\b').hasMatch(text)) {
-        return ActiveTaskControlIntent.discardRemaining;
-      }
-
-      if (RegExp(r'\b(current|this|task|one)\b').hasMatch(text)) {
-        return ActiveTaskControlIntent.discardCurrent;
-      }
-    }
-
-    if (RegExp(r'\b(start|create|make)\b.*\b(new|another)\b.*\btask\b')
-        .hasMatch(text)) {
-      return ActiveTaskControlIntent.startNewTask;
-    }
-
-    return ActiveTaskControlIntent.none;
-  }
-
-  String _voiceControlPrompt(ActiveTaskControlIntent intent) {
-    final current = _taskBatchCurrentTaskNumber ?? 1;
-    final total = _taskBatchTotalTasks ?? current;
-
-    switch (intent) {
-      case ActiveTaskControlIntent.skipCurrent:
-        if (total <= 1) {
-          return 'Do you want to skip Task $current? '
-              'Say yes to skip it, or say continue to keep working on it.';
-        }
-        return 'Do you want to skip Task $current for now? '
-            'I will return to it after the other unfinished tasks. '
-            'Say yes to skip it for now, or say continue to keep working on it.';
-
-      case ActiveTaskControlIntent.discardCurrent:
-        return 'Do you want to discard Task $current? '
-            'This task will not return later. '
-            'Say yes to discard it, or say continue to keep it.';
-
-      case ActiveTaskControlIntent.discardRemaining:
-        return 'Do you want to discard all unfinished tasks in this batch? '
-            'Tasks already saved will not be changed. '
-            'Say yes to discard the unfinished tasks, or say continue to keep them.';
-
-      case ActiveTaskControlIntent.startNewTask:
-        return 'You still have an unfinished task batch. '
-            'Do you want to discard all unfinished tasks and start a new task? '
-            'Tasks already saved will not be changed. '
-            'Say yes to discard them and start new, or say keep tasks.';
-
-      case ActiveTaskControlIntent.ambiguousStop:
-        return 'What would you like to do? '
-            'Say continue task, skip current task, discard current task, '
-            'or discard remaining tasks.';
-
-      case ActiveTaskControlIntent.none:
-        return 'Please continue with the current task.';
-    }
-  }
-
-  Future<void> _beginVoiceTaskControl(ActiveTaskControlIntent intent) async {
-    if (_taskBatchId == null) {
-      return;
-    }
-
-    // Snapshot the last task question/review text before the control prompt
-    // replaces the visible/spoken assistant transcript.
-    final previous = _assistantTranscript.trim();
-    if (_pendingVoiceTaskControlIntent == null && previous.isNotEmpty) {
-      _voiceTaskResumePrompt = previous;
-    }
-
-    _pendingVoiceTaskControlIntent = intent;
-    await _speakBackendText(_voiceControlPrompt(intent));
-  }
-
-  Future<void> _resumeVoiceTaskAfterControl() async {
-    _pendingVoiceTaskControlIntent = null;
-
-    final progress = _voiceTaskProgress();
-    final previous = _voiceTaskResumePrompt?.trim();
-    _voiceTaskResumePrompt = null;
-
-    final parts = <String>[];
-    if (progress.isNotEmpty) {
-      parts.add('Continuing $progress');
-    } else {
-      parts.add('Continuing the current task.');
-    }
-
-    if (previous != null && previous.isNotEmpty) {
-      parts.add(previous);
-    } else {
-      parts.add('Please continue with the current task.');
-    }
-
-    await _speakBackendText(parts.join(' '));
-  }
-
-  Future<void> _executeVoiceTaskControl(ActiveTaskControlIntent intent) async {
-    final batchId = _taskBatchId;
-    final draftId = _taskDraftId;
-
-    if (batchId == null || draftId == null) {
-      _pendingVoiceTaskControlIntent = null;
-      _voiceTaskResumePrompt = null;
-      await _speakBackendText(
-        'I could not find an active task to change. Please try again.',
-      );
-      return;
-    }
-
-    _pendingVoiceTaskControlIntent = null;
-    _voiceTaskResumePrompt = null;
-
-    switch (intent) {
-      case ActiveTaskControlIntent.skipCurrent:
-        final total = _taskBatchTotalTasks ?? 1;
-        final resolution = total <= 1
-            ? await ref
-                  .read(assistantRepositoryProvider)
-                  .cancelTaskBatch(batchId: batchId, draftId: draftId)
-            : await ref
-                  .read(assistantRepositoryProvider)
-                  .deferTaskBatch(batchId: batchId, draftId: draftId);
-
-        await _handleVoiceBatchResolution(
-          resolution,
-          lead: total <= 1
-              ? 'Skipped Task ${resolution.resolvedTaskNumber}. '
-                    'No task was created from it.'
-              : 'Skipped Task ${resolution.resolvedTaskNumber} for now. '
-                    'I will return to it after the other unfinished tasks.',
-        );
-        return;
-
-      case ActiveTaskControlIntent.discardCurrent:
-        final resolution = await ref
-            .read(assistantRepositoryProvider)
-            .cancelTaskBatch(batchId: batchId, draftId: draftId);
-
-        await _handleVoiceBatchResolution(
-          resolution,
-          lead:
-              'Discarded Task ${resolution.resolvedTaskNumber}. '
-              'No task was created from it.',
-        );
-        return;
-
-      case ActiveTaskControlIntent.discardRemaining:
-      case ActiveTaskControlIntent.startNewTask:
-        await ref
-            .read(assistantRepositoryProvider)
-            .abortTaskBatch(batchId: batchId, draftId: draftId);
-
-        await _forgetVoiceBatch();
-        final startNew = intent == ActiveTaskControlIntent.startNewTask;
-        _clearTaskFlow();
-
-        await _speakBackendText(
-          startNew
-              ? 'Discarded all unfinished tasks in the previous batch. '
-                    'Tasks already saved were not changed. '
-                    'What new task would you like to create?'
-              : 'Discarded all unfinished tasks in this batch. '
-                    'Tasks already saved were not changed.',
-        );
-        return;
-
-      case ActiveTaskControlIntent.ambiguousStop:
-      case ActiveTaskControlIntent.none:
-        await _speakBackendText(
-          'No task changes were made. Please continue with the current task.',
-        );
-        return;
-    }
-  }
-
-  Future<void> _handlePendingVoiceTaskControl(String utterance) async {
-    final pending = _pendingVoiceTaskControlIntent;
-    if (pending == null) {
-      return;
-    }
-
-    // "continue", "keep it", or "no" always means cancel the pending
-    // control operation and return to the exact task flow.
-    if (_isContinueTaskSpeech(utterance) ||
-        (pending != ActiveTaskControlIntent.ambiguousStop &&
-            _isCancelSpeech(utterance))) {
-      await _resumeVoiceTaskAfterControl();
-      return;
-    }
-
-    // The ambiguous menu first requires the user to choose an action. Choosing
-    // an action does not mutate anything; it opens the specific confirmation.
-    if (pending == ActiveTaskControlIntent.ambiguousStop) {
-      final selected = _voiceControlSelection(utterance);
-
-      if (selected == ActiveTaskControlIntent.none ||
-          selected == ActiveTaskControlIntent.ambiguousStop) {
-        await _speakBackendText(_voiceControlPrompt(pending));
-        return;
-      }
-
-      await _beginVoiceTaskControl(selected);
-      return;
-    }
-
-    // A clear destructive/skip intent still requires an explicit yes/confirm.
-    if (_isConfirmSpeech(utterance)) {
-      await _executeVoiceTaskControl(pending);
-      return;
-    }
-
-    // If the user changes their mind to another control action, switch the
-    // confirmation target but still do not mutate yet.
-    final selected = _voiceControlSelection(utterance);
-    if (selected != ActiveTaskControlIntent.none && selected != pending) {
-      await _beginVoiceTaskControl(selected);
-      return;
-    }
-
-    await _speakBackendText(_voiceControlPrompt(pending));
-  }
-
   Future<void> _processTaskUtterance(String utterance) async {
     if (_processingTask) {
       _queuedTaskUtterance = utterance;
@@ -1067,35 +799,22 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
 
     try {
       // -----------------------------------------------------
-      // PENDING VOICE TASK-CONTROL CONFIRMATION
+      // CANCEL / STOP SAFETY
       // -----------------------------------------------------
-      if (_pendingVoiceTaskControlIntent != null) {
-        await _handlePendingVoiceTaskControl(utterance);
-        return;
-      }
-
-      // -----------------------------------------------------
-      // ACTIVE BATCH TASK-CONTROL INTENT
-      // -----------------------------------------------------
-      // This MUST run before the current task answer is sent to /continue.
-      // Clear destructive/skip requests open confirmation; generic cancel/stop
-      // opens an action menu. No backend mutation happens here.
-      if (_taskBatchId != null) {
-        final controlIntent = detectActiveTaskControlIntent(utterance);
-        if (controlIntent != ActiveTaskControlIntent.none) {
-          await _beginVoiceTaskControl(controlIntent);
+      // Step 4A intentionally does not map spoken "cancel" to a
+      // destructive batch mutation. That arrives in Voice Step 4B with
+      // explicit Skip / Discard Current / Discard Remaining confirmation.
+      if (_taskFlowActive && _isCancelSpeech(utterance)) {
+        if (_taskBatchId != null) {
+          await _speakBackendText(
+            'This task batch is still active. '
+            'I will not discard anything without confirmation. '
+            'Continue answering the current task, or use the text Assistant '
+            'for skip and discard controls for now.',
+          );
           return;
         }
-      }
 
-      // -----------------------------------------------------
-      // LEGACY STANDALONE CANCEL / STOP
-      // -----------------------------------------------------
-      // Update/delete/complete single-command voice flows retain their old
-      // cancel behavior. Batch creates use the explicit control flow above.
-      if (_taskBatchId == null &&
-          _taskFlowActive &&
-          _isCancelSpeech(utterance)) {
         _clearTaskFlow();
         await _speakBackendText('Cancelled. No changes were made.');
         return;
@@ -1546,8 +1265,6 @@ class _VoiceModeScreenState extends ConsumerState<VoiceModeScreen>
     _taskBatchTotalTasks = null;
     _taskDraftId = null;
     _pendingTaskPreview = null;
-    _pendingVoiceTaskControlIntent = null;
-    _voiceTaskResumePrompt = null;
     _queuedTaskUtterance = null;
   }
 

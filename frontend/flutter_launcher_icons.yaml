@@ -4,9 +4,15 @@
 
   image_path: "assets/icons/app_icon_foreground.png"
 
-  adaptive_icon_background: "#FFF8EB"
+  adaptive_icon_background: "#FFFFFF"
   adaptive_icon_foreground: "assets/icons/app_icon_foreground.png"
-  adaptive_icon_foreground_inset: 8
+
+  # IMPORTANT:
+  # Add more inset so target + task card + robot
+  # stay inside circular/squircle launcher masks.
+  adaptive_icon_foreground_inset: 24
 
   min_sdk_android: 21
+
   remove_alpha_ios: true
+  background_color_ios: "#FFFFFF"

@@ -1,6 +1,7 @@
 """Database queries for reminder configs, reminder times, and deliveries."""
 import datetime as dt
 
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -104,6 +105,20 @@ async def bulk_create_deliveries(
     db.add_all(
         ReminderDelivery(task_id=task_id, reminder_time_id=reminder_time_id, scheduled_for=scheduled_for)
         for task_id, reminder_time_id, scheduled_for in rows
+    )
+    await db.commit()
+
+
+async def delete_future_scheduled_deliveries(db: AsyncSession, task_id: int, now: dt.datetime) -> None:
+    """Drops not-yet-sent deliveries generated under a schedule that just
+    changed; the worker regenerates them from the new schedule. Already
+    sent/cancelled deliveries are history and are kept."""
+    await db.execute(
+        sql_delete(ReminderDelivery).where(
+            ReminderDelivery.task_id == task_id,
+            ReminderDelivery.status == DeliveryStatus.SCHEDULED,
+            ReminderDelivery.scheduled_for > now,
+        )
     )
     await db.commit()
 

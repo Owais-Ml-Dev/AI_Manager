@@ -1,7 +1,9 @@
 """Database queries for occurrences."""
 from datetime import date, datetime, timezone
 
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.features.occurrences.models import Occurrence, OccurrenceStatus
@@ -35,9 +37,37 @@ async def get_by_task_and_date(db: AsyncSession, task_id: int, occurrence_date: 
 
 
 async def bulk_create(db: AsyncSession, task_id: int, dates: list[date]) -> None:
+    """Idempotent: two concurrent syncs of the same task (e.g. dashboard +
+    occurrences endpoint) can both decide a date is missing — ON CONFLICT DO
+    NOTHING lets the second insert become a no-op instead of a 500."""
     if not dates:
         return
-    db.add_all(Occurrence(task_id=task_id, occurrence_date=d) for d in dates)
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        pg_insert(Occurrence)
+        .values(
+            [
+                {"task_id": task_id, "occurrence_date": d, "created_at": now, "updated_at": now}
+                for d in dates
+            ]
+        )
+        .on_conflict_do_nothing(index_elements=["task_id", "occurrence_date"])
+    )
+    await db.commit()
+
+
+async def delete_future_pending(db: AsyncSession, task_id: int, today: date) -> None:
+    """Drops pending occurrences from today on, generated under a schedule
+    that just changed; the next sync regenerates them from the new schedule.
+    Completed/missed/skipped occurrences are history and are kept (spec:
+    schedule edits must not overwrite past records)."""
+    await db.execute(
+        sql_delete(Occurrence).where(
+            Occurrence.task_id == task_id,
+            Occurrence.status == OccurrenceStatus.PENDING,
+            Occurrence.occurrence_date >= today,
+        )
+    )
     await db.commit()
 
 

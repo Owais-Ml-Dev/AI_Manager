@@ -2,7 +2,7 @@
 from datetime import date, datetime, time
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.features.tasks.models import TaskCategory, TaskStatus
 
@@ -33,6 +33,16 @@ class TaskUpdate(BaseModel):
     status: TaskStatus | None = None
     due_date: date | None = None
     due_time: time | None = None
+
+    # Fields are Optional only so PATCH can omit them; these four are NOT NULL
+    # in the database, so an explicit null must be a 422, not a DB error.
+    # (description/due_date/due_time stay nullable — null clears them.)
+    @field_validator("title", "urgent", "important", "status")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        if value is None:
+            raise ValueError("cannot be null")
+        return value
 
 
 class TaskRead(BaseModel):

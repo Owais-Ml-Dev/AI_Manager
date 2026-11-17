@@ -28,6 +28,8 @@ from app.features.assistant.schemas import (
     Intent,
     PendingAction,
 )
+from app.common.exceptions import NotFoundError
+from app.common.exceptions import ValidationError as DomainValidationError
 from app.features.tasks.models import TaskStatus
 from app.features.tasks.service import list_tasks
 
@@ -152,6 +154,11 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
             executor = _EXECUTORS[pending.intent]
             try:
                 reply = await executor(db, user_id, pending)
+            except (NotFoundError, DomainValidationError) as exc:
+                # e.g. the task was deleted between "Confirm?" and "yes" —
+                # tell the user instead of surfacing a 500.
+                logger.info("Confirmed assistant action could not run: %s", exc)
+                reply = f"Couldn't do that: {exc}"
             finally:
                 await conversation_state.clear_pending(user_id)
             return AssistantMessageResponse(reply=reply, state=ConversationState.IDLE)
@@ -179,6 +186,7 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
                 state=ConversationState.AWAITING_TASK_SELECTION,
             )
         pending.task_id = choice["id"]
+        pending.title = choice["title"]  # confirm with the real name, not the search text
         pending.candidates = []
         pending.state = ConversationState.AWAITING_CONFIRMATION
         await conversation_state.set_pending(user_id, pending)
@@ -250,6 +258,7 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
                 reply=f"Which task did you mean?\n{options}", state=pending.state
             )
         pending.task_id = matches[0].id
+        pending.title = matches[0].title  # confirm with the real name, not the search text
 
     pending.state = ConversationState.AWAITING_CONFIRMATION
     await conversation_state.set_pending(user_id, pending)

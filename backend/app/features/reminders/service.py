@@ -88,6 +88,17 @@ async def set_reminder_config(
     old_summary = _summarize(existing) if existing else None
 
     config = await repository.upsert(db, task_id, data)
+
+    if existing is not None:
+        # The schedule changed: anything already generated for the future
+        # under the old schedule is now wrong. Clear it so it regenerates
+        # from the new one (occurrences on next sync, deliveries on next
+        # worker sweep). Past/resolved records stay as history.
+        from app.features.occurrences import repository as occurrences_repository
+
+        await repository.delete_future_scheduled_deliveries(db, task_id, datetime.now())
+        await occurrences_repository.delete_future_pending(db, task_id, date.today())
+
     await history_service.record_schedule_change(db, task_id, old_summary, _summarize(config))
     return config
 
@@ -160,13 +171,19 @@ async def _generate_deliveries_for_task(db: AsyncSession, task_id: int, config: 
     horizon = config.end_date if config.end_date else today + timedelta(days=ROLLING_HORIZON_DAYS)
     eligible_dates = compute_eligible_dates(config, horizon)
 
+    # Only slots still in the future: a slot whose time already passed when
+    # it was generated (e.g. a start_date in the past) is not a reminder
+    # anyone is waiting for — creating it would make the next sweep send a
+    # burst of stale reminders. Generation runs every sweep, ahead of time,
+    # so no legitimately upcoming slot is ever skipped by this.
+    now = datetime.now()
     existing = await repository.get_existing_delivery_slots(db, task_id)
-    new_rows = [
-        (task_id, t.id, datetime.combine(d, t.time_of_day))
-        for d in eligible_dates
-        for t in times
-        if (t.id, datetime.combine(d, t.time_of_day)) not in existing
-    ]
+    new_rows = []
+    for d in eligible_dates:
+        for t in times:
+            slot = datetime.combine(d, t.time_of_day)
+            if slot > now and (t.id, slot) not in existing:
+                new_rows.append((task_id, t.id, slot))
     await repository.bulk_create_deliveries(db, new_rows)
 
 

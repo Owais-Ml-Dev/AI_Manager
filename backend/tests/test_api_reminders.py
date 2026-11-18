@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
+from app.core.database import AsyncSessionLocal
 from app.features.reminders import repository as reminders_repository
 from app.features.reminders import service as reminders_service
 
@@ -156,43 +157,82 @@ async def test_generation_skips_slots_already_in_the_past(client, auth_a, make_t
     assert all(datetime.fromisoformat(d["scheduled_for"]) > now for d in generated)
 
 
-async def test_schedule_change_clears_future_deliveries(client, auth_a, make_task, db):
-    # Regression for bug 1 (delivery side).
+def weekdays_of(rows, status="scheduled"):
+    return {datetime.fromisoformat(d["scheduled_for"]).isoweekday() for d in rows if d["status"] == status}
+
+
+async def test_schedule_change_replaces_future_deliveries(client, auth_a, make_task):
+    # Regression for bug 1 (delivery side). Deliveries now regenerate
+    # immediately on a config change, not on the worker's next pass.
     task = await make_task("gym", category="recurring")
     await set_config(client, auth_a, task["id"], start_date=TODAY.isoformat())
     await add_time(client, auth_a, task["id"], "23:59:59")
-    await _generate(db, task["id"])
-    assert any(
-        datetime.fromisoformat(d["scheduled_for"]).isoweekday() <= 5
-        for d in await deliveries(client, auth_a, task["id"])
-    )
+    assert weekdays_of(await deliveries(client, auth_a, task["id"])) & {1, 2, 3, 4, 5}
 
     await set_config(client, auth_a, task["id"], start_date=TODAY.isoformat(), day_selection_type="weekends")
-    assert await deliveries(client, auth_a, task["id"]) == []  # old schedule's future ones cleared
+    assert weekdays_of(await deliveries(client, auth_a, task["id"])) == {6, 7}
 
-    await _generate(db, task["id"])
-    regenerated = await deliveries(client, auth_a, task["id"])
-    assert regenerated
-    assert all(datetime.fromisoformat(d["scheduled_for"]).isoweekday() >= 6 for d in regenerated)
+
+async def test_changing_reminder_time_moves_future_deliveries(client, auth_a, make_task):
+    task = await make_task("gym", category="recurring")
+    await set_config(client, auth_a, task["id"], start_date=TODAY.isoformat())
+    slot = await add_time(client, auth_a, task["id"], "23:59:58")
+
+    url = f"/tasks/{task['id']}/reminder-config/reminder-times/{slot['id']}"
+    await client.patch(url, json={"time_of_day": "23:59:57"}, headers=auth_a)
+
+    times = {
+        datetime.fromisoformat(d["scheduled_for"]).time().isoformat()
+        for d in await deliveries(client, auth_a, task["id"])
+        if d["status"] == "scheduled"
+    }
+    assert times == {"23:59:57"}  # nothing left firing at the old time
+
+
+async def _due_delivery(client, auth_a, make_task, db, title, minutes_ago):
+    """A one-time task with a single delivery already `minutes_ago` overdue
+    (inserted directly — generation never creates past slots)."""
+    task = await make_task(title)
+    await set_config(client, auth_a, task["id"], start_date=TODAY.isoformat(), end_date=TODAY.isoformat())
+    time_id = (await add_time(client, auth_a, task["id"], "00:00:00"))["id"]
+    due = datetime.now() - timedelta(minutes=minutes_ago)
+    await reminders_repository.bulk_create_deliveries(db, [(task["id"], time_id, due)])
+    return task, due
+
+
+def status_at(rows, when):
+    return next(d["status"] for d in rows if datetime.fromisoformat(d["scheduled_for"]) == when)
 
 
 async def test_sweep_sends_due_and_cancels_completed(client, auth_a, make_task, db):
-    end = TODAY.isoformat()
-    open_task = await make_task("still open")
-    done_task = await make_task("already done")
-    slot = {}
-    for task in (open_task, done_task):
-        await set_config(client, auth_a, task["id"], start_date=end, end_date=end)
-        slot[task["id"]] = (await add_time(client, auth_a, task["id"], "08:00:00"))["id"]
+    open_task, open_due = await _due_delivery(client, auth_a, make_task, db, "still open", 1)
+    done_task, done_due = await _due_delivery(client, auth_a, make_task, db, "already done", 1)
     await client.patch(f"/tasks/{done_task['id']}", json={"status": "completed"}, headers=auth_a)
 
-    # Insert already-due deliveries directly (generation never creates past slots).
-    due = datetime.now() - timedelta(minutes=1)
-    await reminders_repository.bulk_create_deliveries(
-        db, [(tid, time_id, due) for tid, time_id in slot.items()]
-    )
     db.expire_all()
     await reminders_service.run_reminder_sweep(db)
 
-    assert [d["status"] for d in await deliveries(client, auth_a, open_task["id"])] == ["sent"]
-    assert [d["status"] for d in await deliveries(client, auth_a, done_task["id"])] == ["cancelled"]
+    assert status_at(await deliveries(client, auth_a, open_task["id"]), open_due) == "sent"
+    assert status_at(await deliveries(client, auth_a, done_task["id"]), done_due) == "cancelled"
+
+
+async def test_stale_delivery_is_cancelled_not_sent(client, auth_a, make_task, db):
+    task, due = await _due_delivery(client, auth_a, make_task, db, "server was down", 120)
+    db.expire_all()
+    await reminders_service.run_reminder_sweep(db)
+    assert status_at(await deliveries(client, auth_a, task["id"]), due) == "cancelled"
+
+
+async def test_concurrent_sweeps_send_each_reminder_once(client, auth_a, make_task, db, monkeypatch):
+    task, _ = await _due_delivery(client, auth_a, make_task, db, "send me once", 1)
+    sent = []
+    monkeypatch.setattr(
+        reminders_service, "send_reminder_notification", lambda task_id, *_: sent.append(task_id)
+    )
+
+    async def sweep():
+        async with AsyncSessionLocal() as session:
+            await reminders_service.run_reminder_sweep(session)
+
+    await asyncio.gather(sweep(), sweep(), sweep())
+    assert sent.count(task["id"]) == 1

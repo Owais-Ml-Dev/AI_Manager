@@ -1,14 +1,19 @@
-"""The actual Background Worker from the spec's reminder pipeline
+"""The Background Worker from the spec's reminder pipeline
 (Task Schedule -> Scheduling Logic -> Reminder Records -> Background Worker ->
-Notification Service -> User). Runs in-process via FastAPI's lifespan — no
-separate process/infra needed for this scale.
+Notification Service -> User). Runs in-process via FastAPI's lifespan.
 
-Every REMINDER_SWEEP_INTERVAL_SECONDS, it (1) generates any newly-eligible
-delivery rows for every task with a reminder config, then (2) processes every
-delivery whose time has arrived (sends or cancels it).
+Every REMINDER_SWEEP_INTERVAL_SECONDS it sends/cancels due deliveries — one
+capped query, cheap regardless of how many tasks exist. Extending every
+task's rolling horizon is expensive (several queries per task), so that runs
+only at startup and once per new day; config/time edits regenerate their own
+task's deliveries immediately (see reminders.service).
+
+Safe to run in several server processes at once: each delivery is claimed
+atomically before it's sent, and generation inserts are idempotent.
 """
 import asyncio
 import logging
+from datetime import date
 
 from app.core.database import AsyncSessionLocal
 from app.features.reminders.service import generate_all_deliveries, run_reminder_sweep
@@ -18,20 +23,19 @@ logger = logging.getLogger("reminders.worker")
 REMINDER_SWEEP_INTERVAL_SECONDS = 30
 
 
-async def _run_one_sweep() -> None:
-    async with AsyncSessionLocal() as db:
-        await generate_all_deliveries(db)
-        processed = await run_reminder_sweep(db)
-        if processed:
-            logger.info("Reminder sweep processed %d due deliveries", processed)
-
-
 async def reminder_worker_loop() -> None:
+    generated_for: date | None = None
     while True:
         try:
-            await _run_one_sweep()
+            async with AsyncSessionLocal() as db:
+                if generated_for != date.today():
+                    await generate_all_deliveries(db)
+                    generated_for = date.today()
+                processed = await run_reminder_sweep(db)
+                if processed:
+                    logger.info("Reminder sweep processed %d due deliveries", processed)
         except asyncio.CancelledError:
             raise
-        except Exception:  # pragma: no cover - a bad sweep must not kill the worker
+        except Exception:  # a bad sweep must not kill the worker
             logger.exception("Reminder sweep failed")
         await asyncio.sleep(REMINDER_SWEEP_INTERVAL_SECONDS)

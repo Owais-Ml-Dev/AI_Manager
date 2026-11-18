@@ -6,6 +6,7 @@ reminder times work identically for both. The only thing that differs is
 completion behavior (handled by the tasks/occurrences features, not here).
 """
 import datetime as dt
+import logging
 import uuid
 from datetime import date, datetime, timedelta
 
@@ -25,6 +26,8 @@ from app.features.reminders.models import (
 from app.features.reminders.schemas import ReminderConfigWrite
 from app.features.tasks.models import TaskCategory
 from app.features.tasks.service import get_task
+
+logger = logging.getLogger("reminders")
 
 # How far ahead to generate occurrences/reminder deliveries when a reminder
 # config has no end_date (otherwise generation would be unbounded). Re-extends
@@ -92,13 +95,14 @@ async def set_reminder_config(
     if existing is not None:
         # The schedule changed: anything already generated for the future
         # under the old schedule is now wrong. Clear it so it regenerates
-        # from the new one (occurrences on next sync, deliveries on next
-        # worker sweep). Past/resolved records stay as history.
+        # from the new one (occurrences on next sync, deliveries right below).
+        # Past/resolved records stay as history.
         from app.features.occurrences import repository as occurrences_repository
 
         await repository.delete_future_scheduled_deliveries(db, task_id, datetime.now())
         await occurrences_repository.delete_future_pending(db, task_id, date.today())
 
+    await _generate_deliveries_for_task(db, task_id, config)
     await history_service.record_schedule_change(db, task_id, old_summary, _summarize(config))
     return config
 
@@ -124,7 +128,9 @@ async def add_reminder_time(
     config = await get_reminder_config(db, task_id, user_id)
     if await repository.time_exists(db, config.id, time_of_day):
         raise ValidationError(f"Reminder time {time_of_day} already exists for this task")
-    return await repository.create_time(db, config.id, time_of_day)
+    reminder_time = await repository.create_time(db, config.id, time_of_day)
+    await _generate_deliveries_for_task(db, task_id, config)
+    return reminder_time
 
 
 async def _get_owned_reminder_time(
@@ -145,7 +151,12 @@ async def update_reminder_time(
         db, reminder_time.reminder_config_id, time_of_day
     ):
         raise ValidationError(f"Reminder time {time_of_day} already exists for this task")
-    return await repository.update_time(db, reminder_time, time_of_day)
+    updated = await repository.update_time(db, reminder_time, time_of_day)
+    # Upcoming deliveries were generated at the old time; drop and regenerate
+    # them, or they'd still fire at the old time.
+    await repository.delete_future_scheduled_for_time(db, updated.id, datetime.now())
+    await generate_deliveries_for_task(db, task_id)
+    return updated
 
 
 async def delete_reminder_time(
@@ -174,36 +185,54 @@ async def _generate_deliveries_for_task(db: AsyncSession, task_id: int, config: 
     # Only slots still in the future: a slot whose time already passed when
     # it was generated (e.g. a start_date in the past) is not a reminder
     # anyone is waiting for — creating it would make the next sweep send a
-    # burst of stale reminders. Generation runs every sweep, ahead of time,
-    # so no legitimately upcoming slot is ever skipped by this.
+    # burst of stale reminders. Slots are generated ahead of time (on every
+    # config/time change, and daily for the rolling horizon), so no
+    # legitimately upcoming slot is ever skipped by this. Existing slots are
+    # skipped by the insert itself (ON CONFLICT DO NOTHING).
     now = datetime.now()
-    existing = await repository.get_existing_delivery_slots(db, task_id)
-    new_rows = []
-    for d in eligible_dates:
-        for t in times:
-            slot = datetime.combine(d, t.time_of_day)
-            if slot > now and (t.id, slot) not in existing:
-                new_rows.append((task_id, t.id, slot))
-    await repository.bulk_create_deliveries(db, new_rows)
+    rows = [
+        (task_id, t.id, slot)
+        for d in eligible_dates
+        for t in times
+        if (slot := datetime.combine(d, t.time_of_day)) > now
+    ]
+    await repository.bulk_create_deliveries(db, rows)
+
+
+async def generate_deliveries_for_task(db: AsyncSession, task_id: int) -> None:
+    """Regenerates a task's upcoming deliveries right after its reminder
+    config or times change, so they're correct immediately rather than on the
+    worker's next daily pass."""
+    config = await repository.get_by_task_id(db, task_id)
+    if config is not None:
+        await _generate_deliveries_for_task(db, task_id, config)
 
 
 async def generate_all_deliveries(db: AsyncSession) -> None:
-    """Generates any newly-eligible delivery rows for every task that has a
-    reminder config, across all users. Called by the background worker."""
+    """Extends every task's rolling horizon. The worker calls this once a day
+    (and at startup), not every sweep: changes regenerate immediately via
+    generate_deliveries_for_task, so only the date rolling over adds slots."""
     for task_id in await repository.list_task_ids_with_config(db):
-        config = await repository.get_by_task_id(db, task_id)
-        if config is not None:
-            await _generate_deliveries_for_task(db, task_id, config)
+        await generate_deliveries_for_task(db, task_id)
+
+
+# A sweep processes at most this many due deliveries; the rest wait for the
+# next sweep, so a backlog after downtime can't turn into one huge batch.
+SWEEP_BATCH_LIMIT = 500
+# A reminder this far past its time (e.g. the server was down) is cancelled,
+# not sent — a burst of hours-old "do X at 7am" notifications helps no one.
+STALE_AFTER = timedelta(hours=1)
 
 
 async def run_reminder_sweep(db: AsyncSession) -> int:
-    """Processes every SCHEDULED delivery whose time has come: cancels it if
-    the underlying task/occurrence is already completed/cancelled (spec:
-    completed one-time tasks and completed/skipped occurrences must stop
-    generating reminders), otherwise "sends" it via the notification stub.
+    """Processes due SCHEDULED deliveries (oldest first, capped): cancels a
+    delivery that's stale or whose task/occurrence is already completed,
+    skipped or cancelled (spec: those must stop generating reminders);
+    otherwise sends it via the notification service.
 
-    Returns the number of deliveries processed. Called by the background
-    worker — runs across all users, not scoped to a request.
+    Each delivery is claimed atomically before any send, so several server
+    processes running this concurrently never send the same reminder twice.
+    Returns the number of deliveries this sweep processed.
     """
     # Local imports avoid cross-feature import cycles at module load time.
     from app.features.occurrences import repository as occurrences_repository
@@ -212,12 +241,17 @@ async def run_reminder_sweep(db: AsyncSession) -> int:
     from app.features.tasks.models import TaskStatus
 
     now = datetime.now()
-    due = await repository.list_due_scheduled(db, now)
+    due = await repository.list_due_scheduled(db, now, limit=SWEEP_BATCH_LIMIT)
+    processed = 0
 
     for delivery in due:
         task = await tasks_repository.get(db, delivery.task_id)
 
-        should_cancel = task is None or task.status == TaskStatus.CANCELLED
+        should_cancel = (
+            task is None
+            or task.status == TaskStatus.CANCELLED
+            or now - delivery.scheduled_for > STALE_AFTER
+        )
         if not should_cancel and task.category == TaskCategory.ONE_TIME:
             should_cancel = task.status == TaskStatus.COMPLETED
         elif not should_cancel and task.category == TaskCategory.RECURRING:
@@ -230,13 +264,20 @@ async def run_reminder_sweep(db: AsyncSession) -> int:
             )
 
         if should_cancel:
-            await repository.mark_delivery(db, delivery, DeliveryStatus.CANCELLED, sent_at=None)
-        else:
-            send_reminder_notification(
-                task.id, task.title if task else "(deleted task)", delivery.scheduled_for
-            )
-            await repository.mark_delivery(
-                db, delivery, DeliveryStatus.SENT, sent_at=datetime.now(dt.timezone.utc)
-            )
+            if await repository.claim_delivery(db, delivery.id, DeliveryStatus.CANCELLED, sent_at=None):
+                processed += 1
+            continue
 
-    return len(due)
+        # Claim first, then send: if another process got here first, we skip.
+        if not await repository.claim_delivery(
+            db, delivery.id, DeliveryStatus.SENT, sent_at=datetime.now(dt.timezone.utc)
+        ):
+            continue
+        processed += 1
+        try:
+            send_reminder_notification(task.id, task.title, delivery.scheduled_for)
+        except Exception:  # a failed channel must not stop the rest of the sweep
+            logger.exception("Sending reminder delivery %s failed", delivery.id)
+            await repository.mark_delivery_failed(db, delivery.id)
+
+    return processed

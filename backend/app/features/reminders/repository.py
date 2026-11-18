@@ -3,6 +3,8 @@ import datetime as dt
 
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
+from sqlalchemy import update as sql_update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.features.reminders.models import DeliveryStatus, ReminderConfig, ReminderDelivery, ReminderTime
@@ -85,26 +87,48 @@ async def list_task_ids_with_config(db: AsyncSession) -> list[int]:
     return list(result.scalars().all())
 
 
-async def get_existing_delivery_slots(
-    db: AsyncSession, task_id: int
-) -> set[tuple[int, dt.datetime]]:
-    result = await db.execute(
-        select(ReminderDelivery.reminder_time_id, ReminderDelivery.scheduled_for).where(
-            ReminderDelivery.task_id == task_id
-        )
-    )
-    return set(result.all())
-
-
 async def bulk_create_deliveries(
     db: AsyncSession, rows: list[tuple[int, int, dt.datetime]]
 ) -> None:
-    """rows: list of (task_id, reminder_time_id, scheduled_for)."""
+    """rows: list of (task_id, reminder_time_id, scheduled_for).
+
+    Idempotent: slots that already exist are skipped by the database (unique
+    on reminder_time_id + scheduled_for), so callers don't need to check
+    first and concurrent generators can't collide.
+    """
     if not rows:
         return
-    db.add_all(
-        ReminderDelivery(task_id=task_id, reminder_time_id=reminder_time_id, scheduled_for=scheduled_for)
-        for task_id, reminder_time_id, scheduled_for in rows
+    created = dt.datetime.now(dt.timezone.utc)
+    await db.execute(
+        pg_insert(ReminderDelivery)
+        .values(
+            [
+                {
+                    "task_id": task_id,
+                    "reminder_time_id": reminder_time_id,
+                    "scheduled_for": scheduled_for,
+                    "status": DeliveryStatus.SCHEDULED,
+                    "created_at": created,
+                }
+                for task_id, reminder_time_id, scheduled_for in rows
+            ]
+        )
+        .on_conflict_do_nothing(index_elements=["reminder_time_id", "scheduled_for"])
+    )
+    await db.commit()
+
+
+async def delete_future_scheduled_for_time(
+    db: AsyncSession, reminder_time_id: int, now: dt.datetime
+) -> None:
+    """Drops a reminder time's not-yet-sent deliveries after the time itself
+    changed (they'd otherwise still fire at the old time)."""
+    await db.execute(
+        sql_delete(ReminderDelivery).where(
+            ReminderDelivery.reminder_time_id == reminder_time_id,
+            ReminderDelivery.status == DeliveryStatus.SCHEDULED,
+            ReminderDelivery.scheduled_for > now,
+        )
     )
     await db.commit()
 
@@ -123,21 +147,44 @@ async def delete_future_scheduled_deliveries(db: AsyncSession, task_id: int, now
     await db.commit()
 
 
-async def list_due_scheduled(db: AsyncSession, now: dt.datetime) -> list[ReminderDelivery]:
+async def list_due_scheduled(
+    db: AsyncSession, now: dt.datetime, limit: int
+) -> list[ReminderDelivery]:
+    """Oldest first, capped — after downtime a single sweep can't balloon."""
     result = await db.execute(
-        select(ReminderDelivery).where(
+        select(ReminderDelivery)
+        .where(
             ReminderDelivery.status == DeliveryStatus.SCHEDULED,
             ReminderDelivery.scheduled_for <= now,
         )
+        .order_by(ReminderDelivery.scheduled_for)
+        .limit(limit)
     )
     return list(result.scalars().all())
 
 
-async def mark_delivery(
-    db: AsyncSession, delivery: ReminderDelivery, status: DeliveryStatus, sent_at: dt.datetime | None
-) -> None:
-    delivery.status = status
-    delivery.sent_at = sent_at
+async def claim_delivery(
+    db: AsyncSession, delivery_id: int, status: DeliveryStatus, sent_at: dt.datetime | None
+) -> bool:
+    """Atomically moves a delivery out of SCHEDULED. Returns False if another
+    worker/process already claimed it — the caller must then not send it.
+    This compare-and-set is what keeps multiple server processes from
+    sending the same reminder twice."""
+    result = await db.execute(
+        sql_update(ReminderDelivery)
+        .where(ReminderDelivery.id == delivery_id, ReminderDelivery.status == DeliveryStatus.SCHEDULED)
+        .values(status=status, sent_at=sent_at)
+    )
+    await db.commit()
+    return result.rowcount == 1
+
+
+async def mark_delivery_failed(db: AsyncSession, delivery_id: int) -> None:
+    await db.execute(
+        sql_update(ReminderDelivery)
+        .where(ReminderDelivery.id == delivery_id)
+        .values(status=DeliveryStatus.FAILED, sent_at=None)
+    )
     await db.commit()
 
 

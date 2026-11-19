@@ -84,6 +84,44 @@ def _summarize(config: ReminderConfig) -> str:
 async def set_reminder_config(
     db: AsyncSession, task_id: int, user_id: uuid.UUID, data: ReminderConfigWrite
 ) -> ReminderConfig:
+    config = await _save_config(db, task_id, user_id, data)
+    await db.commit()
+    return config
+
+
+async def replace_schedule(
+    db: AsyncSession,
+    task_id: int,
+    user_id: uuid.UUID,
+    data: ReminderConfigWrite,
+    times: list[dt.time],
+    commit: bool = True,
+) -> ReminderConfig:
+    """Sets the schedule AND makes the reminder times exactly `times`, in ONE
+    transaction: the schedule, the times, the regenerated deliveries and
+    occurrences, and the history event are saved together or not at all.
+    With commit=False the caller commits (e.g. together with a new task)."""
+    config = await _save_config(db, task_id, user_id, data)
+    wanted = set(times)
+    current = await repository.list_times(db, config.id)
+    for reminder_time in current:
+        if reminder_time.time_of_day not in wanted:
+            await repository.delete_time(db, reminder_time)  # its deliveries cascade
+    kept = {t.time_of_day for t in current if t.time_of_day in wanted}
+    for time_of_day in sorted(wanted - kept):
+        await repository.create_time(db, config.id, time_of_day)
+    # Deliveries were planned for the old times above; plan them for the new ones.
+    await repository.delete_future_scheduled_deliveries(db, task_id, now_utc())
+    await _generate_deliveries_for_task(db, task_id, config)
+    if commit:
+        await db.commit()
+    return config
+
+
+async def _save_config(
+    db: AsyncSession, task_id: int, user_id: uuid.UUID, data: ReminderConfigWrite
+) -> ReminderConfig:
+    """Everything set_reminder_config does except the commit."""
     task = await get_task(db, task_id, user_id)  # ownership check — raises NotFoundError if not owned
     if task.category == TaskCategory.ONE_TIME and data.end_date is None:
         raise ValidationError("end_date is required for one-time tasks")
@@ -112,7 +150,6 @@ async def set_reminder_config(
     await generate_occurrences(db, task_id, today_in(await task_owner_zone(db, task_id)))
     await apply_time_based_changes(db, task_id)
     await history_service.record_schedule_change(db, task_id, old_summary, _summarize(config))
-    await db.commit()
     return config
 
 

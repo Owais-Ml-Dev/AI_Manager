@@ -36,12 +36,16 @@ async def create_task(
     important: bool,
     due_date: date | None = None,
     due_time=None,
+    commit: bool = True,
 ) -> Task:
+    """commit=False lets a caller save more in the same transaction (the
+    assistant creates a recurring task and its schedule as one unit)."""
     task = await repository.create(
         db, user_id, title, category, description, urgent, important, due_date, due_time
     )
     await history_service.record_created(db, task.id)
-    await db.commit()
+    if commit:
+        await db.commit()
     return task
 
 

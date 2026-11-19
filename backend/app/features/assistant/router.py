@@ -19,4 +19,4 @@ async def send_message(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    return await service.handle_message(db, uuid.UUID(user_id), payload.message)
+    return await service.handle_message(db, uuid.UUID(user_id), payload.message, payload.input)

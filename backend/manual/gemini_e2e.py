@@ -266,7 +266,39 @@ def build_reworded_steps() -> list[Step]:
     ]
 
 
+def build_step4_steps() -> list[Step]:
+    """Recurring tasks, reminders on existing tasks, pause/resume and
+    voice-style replies — phrasings that appear nowhere in the prompt. The
+    replies are written by Python from Gemini's fields, so matching them
+    checks what Gemini extracted (days, times, intent)."""
+    S = Step
+    recurring = lambda t: t["category"] == "recurring"  # noqa: E731
+    return [
+        S("Recurring, specific days", "Add a task to water the plants every Monday, Wednesday and Friday at 7am",
+          "awaiting_confirmation", absent_like("water"), expect_reply="every Mon, Wed and Fri at 07:00"),
+        S("Recurring, specific days", "yes", "idle", has_like("water", recurring, "recurring")),
+        S("Recurring, daily", "I want to meditate daily at 6:30 in the morning", "awaiting_confirmation",
+          count_is(1), expect_reply="every day at 06:30"),
+        S("Recurring, daily", "yeah do it", "idle", has_like("meditat", recurring, "recurring")),
+        S("Recurring, asks days", "new recurring task: call grandma", "collecting_information",
+          count_is(2), expect_reply="Which days"),
+        S("Recurring, asks days", "sundays", "awaiting_confirmation", count_is(2), expect_reply="every Sun"),
+        S("Recurring, asks days", "haan", "idle", has_like("grandma", recurring, "recurring")),
+        S("Reminder on existing", "Remind me about calling grandma at 5pm", "awaiting_confirmation",
+          count_is(3), expect_reply="at 17:00"),
+        S("Reminder on existing", "ok", "idle", count_is(3)),
+        S("Pause", "Put the meditation task on hold", "awaiting_confirmation", count_is(3), expect_reply="Pause"),
+        S("Pause", "yes please", "idle", has_like("meditat", lambda t: t["status"] == "paused", "paused")),
+        S("Resume", "Start meditation again", "awaiting_confirmation", count_is(3), expect_reply="Resume"),
+        S("Resume", "sure", "idle", has_like("meditat", lambda t: t["status"] == "pending", "pending")),
+        S("One-time with time", "Remind me to submit the tax form by Friday at 5pm", "awaiting_confirmation",
+          count_is(3), expect_reply="at 17:00"),
+        S("One-time with time", "no thanks", "idle", count_is(3), "Voice-style no, nothing written"),
+    ]
+
+
 REWORDED = "--reworded" in sys.argv
+STEP4 = "--step4" in sys.argv
 # Marks the primary model "out of quota" in Redis for this run, to watch every
 # request go straight to the first backup (and the primary never be called).
 FORCE_FALLBACK = "--force-fallback" in sys.argv
@@ -323,8 +355,9 @@ def build_steps() -> list[Step]:
           "Only the NEW request ran"),
         # 8. things that must NOT write
         S("Not a task", "What's the weather today?", "idle", count_is(2)),
-        S("Unsupported", "Remind me about Water the plants every day at 7am", "idle", count_is(2),
-          "configure_reminder isn't supported by voice yet"),
+        S("Reminder (asks end)", "Remind me about Water the plants every day at 7am", "collecting_information",
+          count_is(2), "One-time task without a due date: asks until when", expect_reply="Until which date"),
+        S("Reminder (asks end)", "no", "idle", count_is(2), "Rule-based cancel"),
         S("Not found", "Delete Buy a spaceship", "idle", count_is(2)),
         S("Hinglish", "kal doodh lana hai, uska task bana do", "awaiting_confirmation", count_is(2),
           "Non-English understanding"),
@@ -405,7 +438,7 @@ async def run() -> None:
         print(f"   (--force-fallback: {settings.gemini_model_chain[0]} marked exhausted for this run)")
 
     results: list[Result] = []
-    steps = build_reworded_steps() if REWORDED else build_steps()
+    steps = build_step4_steps() if STEP4 else build_reworded_steps() if REWORDED else build_steps()
     run_start = time.perf_counter()
     for i, step in enumerate(steps, 1):
         if step.section == "Ambiguous name" and step.message.startswith("Delete the meeting"):
@@ -505,7 +538,7 @@ def build_report(results: list[Result], auth_log: list[str], total_run: float, c
     tok = lambda attr: sum(getattr(a, attr) or 0 for a in ok_calls)  # noqa: E731
 
     lines = [
-        f"# Gemini end-to-end run ({'reworded' if REWORDED else 'main'} set) - {datetime.now():%Y-%m-%d %H:%M}",
+        f"# Gemini end-to-end run ({'step4' if STEP4 else 'reworded' if REWORDED else 'main'} set) - {datetime.now():%Y-%m-%d %H:%M}",
         "",
         f"**Result: {passed}/{len(results)} steps passed.** Account: `{EMAIL}`. Model "
         f"chain `{' > '.join(settings.gemini_model_chain)}` -> answered by `{', '.join(versions) or 'n/a'}`"

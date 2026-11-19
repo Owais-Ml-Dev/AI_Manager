@@ -262,7 +262,7 @@ Authorization: Bearer {{token}}
 ###############################################################################
 # 6. AI ASSISTANT — send IN ORDER; watch "state" in each reply
 #    Gemini only turns your sentence into JSON. Nothing is written until you
-#    answer "yes" — and "yes"/"no"/numbers never even reach Gemini.
+#    answer yes — and yes/no/choice replies never even reach Gemini.
 ###############################################################################
 
 ### 6a. Create -> expect state "awaiting_confirmation", NO task created yet (check 2c)
@@ -335,6 +335,42 @@ Authorization: Bearer {{token}}
 Content-Type: application/json
 
 { "message": "1" }
+
+### 6j. Recurring task with its schedule -> "every Mon, Wed and Fri at 07:00", then send 6b
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Add a task to water the plants every Monday, Wednesday and Friday at 7am" }
+
+### 6k. Missing days -> "Which days should it repeat on?" (answer e.g. "sundays", then "yes")
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "new recurring task: call grandma" }
+
+### 6l. Reminder on an existing task, pause, resume (each -> confirmation, then "yes")
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Remind me about calling grandma at 5pm" }
+
+###
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Put the grandma task on hold" }
+
+### 6m. Voice input: same logic; spoken replies like "yeah do it", "haan", "no thanks",
+# "the second one" are understood without calling Gemini.
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Yes please.", "input": "voice" }
 
 ### 6i. Not a task request -> polite "didn't understand", nothing happens
 POST {{baseUrl}}/assistant/message

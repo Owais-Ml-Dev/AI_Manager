@@ -132,16 +132,52 @@ def test_month_range_handles_december():
     assert _month_range(2028, 2) == (date(2028, 2, 1), date(2028, 2, 29))
 
 
-def test_assistant_lists_missing_title():
-    pending = PendingAction(state=ConversationState.IDLE, intent=Intent.CREATE_TASK)
-    assert _missing_required(Intent.CREATE_TASK, pending) == ["title"]
+def test_assistant_lists_missing_details():
+    P, I, S = PendingAction, Intent, ConversationState.IDLE
+    assert _missing_required(P(state=S, intent=I.CREATE_TASK)) == ["title"]
+    assert _missing_required(P(state=S, intent=I.CREATE_TASK, title="x", category="one_time")) == []
+    # recurring needs its days; specific days need the weekdays
+    assert _missing_required(P(state=S, intent=I.CREATE_TASK, title="x", category="recurring")) == ["day_selection"]
+    assert _missing_required(P(state=S, intent=I.CREATE_TASK, title="x", category="recurring",
+                               day_selection="custom_weekdays")) == ["weekdays"]
+    # a reminder needs its time
+    assert _missing_required(P(state=S, intent=I.CONFIGURE_REMINDER, title="x", day_selection="every_day")) == ["times"]
 
 
-def test_assistant_confirmation_mentions_task_and_due_date():
-    pending = PendingAction(
-        state=ConversationState.IDLE, intent=Intent.CREATE_TASK, title="Buy milk", due_date=MON
-    )
-    assert _confirmation_message(pending) == 'Create a one-time task "Buy milk", due 2026-11-16. Confirm?'
+def test_assistant_confirmation_messages():
+    from datetime import time
+
+    P, S = PendingAction, ConversationState.IDLE
+    one = P(state=S, intent=Intent.CREATE_TASK, title="Buy milk", category="one_time", due_date=MON)
+    assert _confirmation_message(one, MON) == 'Create a one-time task "Buy milk", due 2026-11-16. Confirm?'
+    rec = P(state=S, intent=Intent.CREATE_TASK, title="Swim", category="recurring",
+            day_selection="custom_weekdays", weekdays=[2, 4], times=[time(6, 0), time(18, 30)])
+    assert _confirmation_message(rec, MON) == (
+        'Create recurring task "Swim": every Tue and Thu at 06:00 and 18:30, starting today. Confirm?')
+    pause = P(state=S, intent=Intent.PAUSE_TASK, title="Swim")
+    assert _confirmation_message(pause, MON).startswith('Pause "Swim"')
+
+
+# --- voice-friendly replies (pure) ---------------------------------------------
+
+def test_yes_no_replies_tolerate_speech_and_hinglish():
+    from app.features.assistant.replies import is_no, is_yes
+
+    for t in ["yes", "Yes.", "yes please", "yeah do it", "sure, go ahead", "ok confirm", "haan", "theek hai", "ji haan"]:
+        assert is_yes(t) and not is_no(t), t
+    for t in ["no", "No.", "no thanks", "nope", "cancel it", "never mind", "nahi", "mat karo", "ji nahi"]:
+        assert is_no(t) and not is_yes(t), t
+    # A changed request must never count as confirmation (or refusal).
+    for t in ["yes but make it 8am", "yes delete the gym one", "no, yes", "move it to friday"]:
+        assert not is_yes(t) and not is_no(t), t
+
+
+def test_choice_replies():
+    from app.features.assistant.replies import is_number_reply, parse_choice
+
+    assert [parse_choice(t, 3) for t in ["2", "the second one", "number two", "dusra", "option 3", "first one"]] == [2, 2, 2, 2, 3, 1]
+    assert [parse_choice(t, 3) for t in ["7", "2 and 3", "do it", "delete meeting"]] == [None, None, None, None]
+    assert is_number_reply("7") and not is_number_reply("do it")
 
 
 # --- assistant task lookup (pure, no DB) ---------------------------------------
@@ -165,6 +201,20 @@ def test_task_lookup_is_deterministic_and_never_guesses():
     assert titles("meetings with the client") == ["Meeting with client"]
     assert titles("buy a spaceship") == []
     assert titles("task") == []                                    # only filler -> no match
+
+
+def test_task_lookup_links_word_forms_stemming_misses():
+    # Seen live: Gemini said "meditation", the task is "meditate".
+    from types import SimpleNamespace as T
+
+    from app.features.assistant.service import _match_tasks
+    from app.features.tasks.models import TaskStatus
+
+    tasks = [T(title=n, status=TaskStatus.PENDING) for n in ["meditate", "Update report", "planning session"]]
+    titles = lambda q: [t.title for t in _match_tasks(tasks, q)]  # noqa: E731
+    assert titles("the meditation task") == ["meditate"]
+    assert titles("updating the report") == ["Update report"]
+    assert titles("planting") == []  # "plant" vs "plann": first 5 letters differ
 
 
 # --- Gemini quota replies (pure parsing, no network) --------------------------
@@ -201,3 +251,12 @@ def test_quota_parse_unreadable_body_never_locks_a_model_out_long():
 def test_quota_parse_retired_model():
     hit = _parse_quota(_httpx.Response(404, json={"error": {"message": "no longer available"}}))
     assert hit.kind == "retired" and hit.seconds == 24 * 3600
+
+
+def test_gemini_null_lists_are_accepted():
+    # Seen live (gemini-3.1-flash-lite): empty lists come back as null.
+    from app.features.assistant.schemas import GeminiIntentOutput
+
+    parsed = GeminiIntentOutput.model_validate({
+        "intent": "pause_task", "title": "meditation", "weekdays": None, "times": None, "missing_fields": None})
+    assert (parsed.weekdays, parsed.times, parsed.missing_fields) == ([], [], [])

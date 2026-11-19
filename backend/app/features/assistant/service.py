@@ -11,12 +11,13 @@ confirmation step from this exact pending action — a modified request
 invalidates whatever was pending before it.
 """
 import logging
+import re
 import uuid
 
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.gemini import GeminiError, generate_json
+from app.core.gemini import GeminiError, GeminiUnavailableError, generate_json
 from app.features.assistant import conversation_state, dispatcher
 from app.features.assistant.schemas import (
     LOOKUP_INTENTS,
@@ -81,10 +82,52 @@ def _confirmation_message(pending: PendingAction) -> str:
     return "Confirm?"  # pragma: no cover - all write intents handled above
 
 
+# Words people add around a task's name ("the passport task", "passport wala
+# task", "my gym one") that are not part of the name itself.
+_FILLER_WORDS = {
+    "a", "an", "the", "my", "this", "that", "task", "tasks", "one", "item", "todo",
+    "please", "wala", "wali", "wale", "vala", "vali", "ka", "ki", "ke", "to", "for", "of",
+}
+
+
+def _stem(word: str) -> str:
+    """Crude, predictable suffix stripping so "feeding"/"feeds" match "feed".
+    Deliberately simple: applied identically to query and titles, and
+    repeated until stable so "meetings" and "meeting" both reach "meet"."""
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ("ing", "ed", "es", "s"):
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                word = word[: -len(suffix)]
+                changed = True
+                break
+    return word
+
+
+def _key_words(text: str) -> set[str]:
+    return {_stem(w) for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _FILLER_WORDS}
+
+
+def _match_tasks(tasks: list, query: str) -> list:
+    """Deterministic task lookup (no AI). 1) titles containing the query text;
+    if none, 2) titles containing every key word of the query, after removing
+    filler words and stemming — so "feeding the cat" finds "Feed the cat" and
+    "passport wala task" finds "Renew passport". Several hits -> the caller
+    asks the user to pick; it never guesses."""
+    active = [t for t in tasks if t.status != TaskStatus.CANCELLED]
+    needle = query.strip().lower()
+    exact = [t for t in active if needle in t.title.lower()]
+    if exact:
+        return exact
+    wanted = _key_words(query)
+    if not wanted:
+        return []
+    return [t for t in active if wanted <= _key_words(t.title)]
+
+
 async def _find_task_by_title(db: AsyncSession, user_id: uuid.UUID, title: str) -> list:
-    tasks = await list_tasks(db, user_id)
-    needle = title.strip().lower()
-    return [t for t in tasks if t.status != TaskStatus.CANCELLED and needle in t.title.lower()]
+    return _match_tasks(await list_tasks(db, user_id), title)
 
 
 def _apply_gemini_output(pending: PendingAction, parsed: GeminiIntentOutput) -> PendingAction:
@@ -118,9 +161,9 @@ async def _build_prompt(message: str, pending: PendingAction) -> str:
             context += (
                 f"You just asked the user for their '{field}', and this message is their direct "
                 f"answer to that — extract it as the '{field}' value even if it's a bare phrase "
-                f"with no task-management keywords in it (e.g. a reply of just \"Water the plants\" "
-                f"or \"call it Water the plants\" to a question about the title means "
-                f'title=\\"Water the plants\\"). Keep intent as \'{pending.intent.value}\'.\n'
+                f"with no task-management keywords in it (e.g. a reply of just \"Pay rent\" "
+                f"or \"name it Pay rent\" to a question about the title means "
+                f'title=\\"Pay rent\\"). Keep intent as \'{pending.intent.value}\'.\n'
             )
 
     return f"""You are a task-manager assistant. Extract structured intent from the user's
@@ -135,6 +178,15 @@ message and return ONLY a JSON object, no markdown, no explanation, matching exa
   "due_date": "YYYY-MM-DD" or null,  // resolve relative dates using today's date below
   "missing_fields": []           // field names above you could not determine but the intent needs
 }}
+
+How to choose the intent:
+- create_task ONLY when the user wants a NEW task ("add", "create", "new task", "remind me to...").
+- A message about an EXISTING task by name is never create_task:
+  - "make X urgent", "X is important", "mark X as not urgent", "prioritize X" -> change_priority
+  - "rename X to Y", "change X's title" -> update_task (title=X, new_title=Y)
+  - "mark X as done", "finished X", "complete X" -> complete_task
+  - "delete X", "remove X" -> delete_task
+- The user may write in any language (e.g. Hindi/Hinglish); keep the task title in the user's words.
 
 Today's date is {date.today().isoformat()}.
 {context}
@@ -172,26 +224,51 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
         pending = PendingAction(state=ConversationState.IDLE)
 
     elif pending.state == ConversationState.AWAITING_TASK_SELECTION:
-        choice = None
-        if text.isdigit() and 1 <= int(text) <= len(pending.candidates):
-            choice = pending.candidates[int(text) - 1]
+        if text in _NO_WORDS:
+            await conversation_state.clear_pending(user_id)
+            return AssistantMessageResponse(reply="Cancelled.", state=ConversationState.IDLE)
+
+        if text.isdigit():
+            # A number is always a pick — re-ask if it's out of range rather
+            # than sending a bare number to Gemini as a new request.
+            if 1 <= int(text) <= len(pending.candidates):
+                choice = pending.candidates[int(text) - 1]
+            else:
+                options = "\n".join(f"{i+1}) {c['title']}" for i, c in enumerate(pending.candidates))
+                return AssistantMessageResponse(
+                    reply=f"Please pick a number from 1 to {len(pending.candidates)}:\n{options}",
+                    state=ConversationState.AWAITING_TASK_SELECTION,
+                )
         else:
             matches = [c for c in pending.candidates if text in c["title"].lower()]
-            if len(matches) == 1:
-                choice = matches[0]
-        if choice is None:
-            options = "\n".join(f"{i+1}) {c['title']}" for i, c in enumerate(pending.candidates))
+            choice = matches[0] if len(matches) == 1 else None
+
+        if choice is not None:
+            pending.task_id = choice["id"]
+            pending.title = choice["title"]  # confirm with the real name, not the search text
+            pending.candidates = []
+            pending.state = ConversationState.AWAITING_CONFIRMATION
+            await conversation_state.set_pending(user_id, pending)
             return AssistantMessageResponse(
-                reply=f"I'm not sure which one you mean. Please pick a number:\n{options}",
-                state=ConversationState.AWAITING_TASK_SELECTION,
+                reply=_confirmation_message(pending), state=pending.state
             )
-        pending.task_id = choice["id"]
-        pending.title = choice["title"]  # confirm with the real name, not the search text
-        pending.candidates = []
-        pending.state = ConversationState.AWAITING_CONFIRMATION
-        await conversation_state.set_pending(user_id, pending)
+
+        # Not a pick: the user moved on ("actually, delete X instead", a new
+        # question...). Drop the selection and treat it as a fresh message —
+        # same rule as a modified request during confirmation. Previously this
+        # re-asked forever, trapping the user until the state expired.
+        await conversation_state.clear_pending(user_id)
+        pending = PendingAction(state=ConversationState.IDLE)
+
+    # "no"/"cancel" with nothing to confirm or pick: answer by rule. Cancels
+    # an in-progress question ("What's the title?"), else there's nothing to
+    # cancel — no reason to ask Gemini (and wait seconds) for this.
+    if text in _NO_WORDS:
+        had_request = pending.intent is not None
+        await conversation_state.clear_pending(user_id)
         return AssistantMessageResponse(
-            reply=_confirmation_message(pending), state=pending.state
+            reply="Cancelled." if had_request else "Nothing to cancel.",
+            state=ConversationState.IDLE,
         )
 
     # --- Gemini call (fresh message, or filling in missing fields) ---
@@ -199,6 +276,14 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
     try:
         raw = await generate_json(prompt)
         parsed = GeminiIntentOutput.model_validate(raw)
+    except GeminiUnavailableError as exc:
+        # Gemini down/slow: not the user's wording, so don't ask them to
+        # rephrase. Any in-progress request is kept for their retry.
+        logger.warning("Gemini unavailable, degrading gracefully: %s", exc)
+        return AssistantMessageResponse(
+            reply="The assistant is busy right now. Please try again in a moment.",
+            state=pending.state,
+        )
     except GeminiError as exc:
         logger.warning("Gemini call failed, degrading gracefully: %s", exc)
         return AssistantMessageResponse(
@@ -262,4 +347,16 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
 
     pending.state = ConversationState.AWAITING_CONFIRMATION
     await conversation_state.set_pending(user_id, pending)
-    return AssistantMessageResponse(reply=_confirmation_message(pending), state=pending.state)
+    reply = _confirmation_message(pending)
+
+    # Deterministic guard against Gemini misreading "make X urgent" as a
+    # create: if a task with this exact title already exists, say so before
+    # the user confirms, so a duplicate is never created by accident.
+    if pending.intent == Intent.CREATE_TASK:
+        wanted = pending.title.strip().lower()
+        if any(t.title.strip().lower() == wanted for t in await _find_task_by_title(db, user_id, pending.title)):
+            reply = (
+                f'Note: you already have a task called "{pending.title}". '
+                f"If you meant to change it, say no and tell me what to change. " + reply
+            )
+    return AssistantMessageResponse(reply=reply, state=pending.state)

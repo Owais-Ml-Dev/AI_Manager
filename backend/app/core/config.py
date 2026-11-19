@@ -20,10 +20,13 @@ class Settings(BaseSettings):
 
     # Google Gemini API key (used starting phase 4, optional until then)
     gemini_api_key: str = ""
-    # Alias (auto-updates to the current recommended lite model) rather than a
-    # pinned version — intent extraction is a lightweight task, use the
-    # smallest model that meets the bar (MSI).
-    gemini_model: str = "gemini-flash-lite-latest"
+    # Pinned version, not a "-latest" alias, so Google can't swap the model
+    # (and its speed/behavior) underneath us. Chosen by
+    # manual/gemini_model_bench.py on 2026-11-19: 31/32 correct, median 1.2s
+    # vs 4.5s for gemini-3.5-flash-lite at the same accuracy. Intent
+    # extraction is a lightweight task — smallest model that meets the bar (MSI).
+    # Override with GEMINI_MODEL in .env.
+    gemini_model: str = "gemini-3.1-flash-lite"
 
     # Supabase project URL, used to fetch its public JWKS for verifying
     # Supabase Auth access tokens. Not a secret.

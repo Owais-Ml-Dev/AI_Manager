@@ -171,9 +171,60 @@ automated `pytest` suite yet, despite `pytest`/`pytest-asyncio` being in
   the matching overall-recurring-performance formula. Fixed to track per-task
   eligibility (date ≤ today, not skipped) the same way as the aggregate.
 
+## Live testing, assistant hardening, region move, model choice (2026-11-18/19)
+
+**Test tooling** (`backend/manual/`): `manual_tests.http` (VS Code REST Client
+walkthrough of every endpoint; login read from `manual/.env`, gitignored),
+`gemini_e2e.py` (automated sign-up/login + full assistant conversation against the REAL
+Gemini, DB-checked after every message, per-call latency/tokens/model version, report
+to `manual/reports/`, gitignored; `--reworded` runs phrasings that appear nowhere in the
+prompt), `gemini_model_bench.py` (same 16 messages to several models, speed + graded
+accuracy). Pytest suite: 72 tests.
+
+**Assistant bugs found by the live runs, fixed with regression tests:**
+- Task selection trapped the user: anything but a number re-asked "which one?" forever
+  (even "no") until the 10-min state expired. Now "no" cancels, an out-of-range number
+  re-asks, anything else is treated as a new request.
+- Gemini read "make X urgent" as `create_task` -> confirming created a duplicate. Prompt
+  now spells out create vs change_priority/update/complete/delete; Python also warns
+  before confirming a create whose exact title already exists.
+- Task lookup was substring-only: "feeding the cat" didn't find "Feed the cat",
+  "passport wala task" found nothing. Now deterministic: substring first, then
+  all-key-words match after removing filler words and simple stemming. Never guesses —
+  several matches still ask the user to pick. (A vector DB was considered and rejected:
+  overkill for matching within one user's own task list, adds an AI call and
+  nondeterminism.)
+- A prompt example matched a test message word for word ("call it Water the plants"),
+  inflating that test. Replaced with a neutral example; the `--reworded` set guards
+  against this.
+- Gemini down/slow now replies "The assistant is busy... try again" and keeps the
+  in-progress request (was "didn't understand", which blamed the user's wording).
+  `GeminiUnavailableError` (timeout/network/429/5xx) vs `GeminiError` (unusable answer).
+- "no"/"cancel" with nothing pending is answered by rule ("Nothing to cancel."), no
+  Gemini call; it also cancels a half-collected request.
+
+**Latency.** Measured, not assumed: the DB was in Tokyo (~300 ms per round trip from
+India) and requests make several sequential round trips (connection pre-ping + BEGIN,
+prepare + execute per new statement, COMMIT) -> list tasks 3.4s, assistant "yes" 6.5s,
+dashboard 9.6s. Moved to a new Supabase project in **Mumbai (ap-south-1)**, same
+migrations: round trip 6 ms; list tasks 0.07s, "yes" 0.19s, dashboard 0.23s; pytest
+~15 min -> 33s. Gemini is now ~95% of assistant response time.
+
+**Gemini model.** Benchmarked on the real prompt (2026-11-19): `gemini-3.1-flash-lite`
+31/32 correct, median 1.2s; `gemini-3.5-flash-lite` (what `-latest` resolved to) 30/32,
+median 4.5s. `gemini-2.5-flash` / `-lite` are retired for new users; `gemini-3.8-flash`
+allows only 20 requests/day on the free tier (unusable without a paid plan). Now pinned
+to `gemini-3.1-flash-lite` (override with `GEMINI_MODEL`). Requests use
+`responseMimeType: application/json`; all answer parts are joined; unparseable answers
+log `finishReason` + model version (a rare cut-off answer was seen once, cause not yet
+confirmed). Timeout 8s per attempt + 1 retry: 4s was tried and cut off real 4-8s
+answers; 8s gave 0 user-visible failures in 33 calls. Free tier also rate-limits per
+minute (429), which the fast backend can now hit.
+
 ## Environment / secrets
 
 `backend/.env` (gitignored, never committed) holds: `DATABASE_URL` (Supabase pooler
-connection string), `SUPABASE_URL` (not secret, used for JWKS), `REDIS_URL` (still
-placeholder — Upstash not yet configured), `GEMINI_API_KEY` (empty, for Phase 4).
+connection string), `SUPABASE_URL` (not secret, used for JWKS), `REDIS_URL` (Upstash,
+TLS), `GEMINI_API_KEY`, optional `GEMINI_MODEL`. `backend/.env.test` holds the pytest accounts
+and publishable key; `backend/manual/.env` the manual-testing login.
 `backend/.env.example` is the template, kept free of real values.

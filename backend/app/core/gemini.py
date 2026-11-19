@@ -21,26 +21,38 @@ _API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 # message — observed in practice, worth one retry before giving up.
 _MAX_ATTEMPTS = 2
 _RETRY_DELAY_SECONDS = 1.5
+# gemini-3.1-flash-lite answers in ~1.5s (median), but real answers can take
+# 4-8s. Measured 2026-11-19: 4s per attempt cut off real answers (2 of ~20
+# messages got "busy" after both attempts timed out); 8s gave 0 user-visible
+# failures in 33 calls, the occasional stuck call recovering on the retry.
+# Worst case ~17.5s (8 + 1.5 delay + 8) before the user is told to retry.
+_TIMEOUT_SECONDS = 8.0
 
 
 class GeminiError(Exception):
-    pass
+    """Gemini's answer couldn't be used (bad shape, not JSON, 4xx)."""
+
+
+class GeminiUnavailableError(GeminiError):
+    """Gemini is down, overloaded or too slow (timeout, network, 429, 5xx) —
+    worth telling the user to try again, unlike a GeminiError."""
 
 
 async def _post_once(prompt: str) -> httpx.Response:
     url = f"{_API_BASE}/{settings.gemini_model}:generateContent"
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
         return await client.post(
             url,
             params={"key": settings.gemini_api_key},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                # This model "thinks" before answering (consumes output
-                # tokens on hidden reasoning); without headroom that can
-                # truncate the actual JSON mid-output. thinkingConfig isn't
-                # accepted for this model via this API version, so the fix is
-                # just a generous budget rather than disabling thinking.
-                "generationConfig": {"maxOutputTokens": 2048},
+                # Some models "think" before answering (hidden reasoning
+                # consumes output tokens); a generous budget keeps that from
+                # truncating the JSON. responseMimeType makes Gemini emit
+                # JSON only (no prose/markdown), which guards against the
+                # rare malformed answers seen in testing. Python still
+                # validates everything it returns.
+                "generationConfig": {"maxOutputTokens": 2048, "responseMimeType": "application/json"},
             },
         )
 
@@ -59,9 +71,9 @@ async def generate_json(prompt: str) -> dict:
         try:
             response = await _post_once(prompt)
         except httpx.HTTPError as exc:
-            logger.warning("Gemini request failed (attempt %d): %s", attempt, exc)
+            logger.warning("Gemini request failed (attempt %d): %s %s", attempt, type(exc).__name__, exc)
             if attempt == _MAX_ATTEMPTS:
-                raise GeminiError(f"Gemini request failed: {exc}") from exc
+                raise GeminiUnavailableError(f"Gemini request failed: {type(exc).__name__} {exc}") from exc
             await asyncio.sleep(_RETRY_DELAY_SECONDS)
             continue
 
@@ -73,14 +85,19 @@ async def generate_json(prompt: str) -> dict:
 
     if response.status_code != 200:
         logger.warning("Gemini returned %d: %s", response.status_code, response.text[:300])
+        if response.status_code == 429 or response.status_code >= 500:
+            raise GeminiUnavailableError(f"Gemini returned {response.status_code}: {response.text[:300]}")
         raise GeminiError(f"Gemini returned {response.status_code}: {response.text[:300]}")
 
     try:
         data = response.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        candidate = data["candidates"][0]
+        # An answer can arrive split across several parts; read them all.
+        text = "".join(part.get("text", "") for part in candidate["content"]["parts"])
     except (KeyError, IndexError, ValueError) as exc:
         logger.warning("Unexpected Gemini response shape: %s — body: %s", exc, response.text[:300])
         raise GeminiError(f"Unexpected Gemini response shape: {exc}") from exc
+    finish_reason = candidate.get("finishReason")
 
     text = text.strip()
     if text.startswith("```"):
@@ -92,5 +109,8 @@ async def generate_json(prompt: str) -> dict:
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
-        logger.warning("Gemini did not return valid JSON: %s", text[:300])
+        # finishReason says WHY it stopped (e.g. MAX_TOKENS, SAFETY) — the
+        # missing clue for the rare cut-off answers seen in testing.
+        logger.warning("Gemini did not return valid JSON (finishReason=%s, model=%s): %s",
+                       finish_reason, data.get("modelVersion"), text[:300])
         raise GeminiError(f"Gemini did not return valid JSON: {text[:300]}") from exc

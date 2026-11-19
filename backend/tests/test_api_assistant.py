@@ -6,7 +6,7 @@ plain rules without any Gemini call. Includes regressions for bug 5.
 """
 import pytest
 
-from app.core.gemini import GeminiError
+from app.core.gemini import GeminiError, GeminiUnavailableError
 from app.features.assistant import service as assistant_service
 
 pytestmark = pytest.mark.usefixtures("clean_accounts")
@@ -96,6 +96,38 @@ async def test_ambiguous_title_selection_confirms_real_name(client, auth_a, gemi
     assert chosen not in remaining and len(remaining) == 1
 
 
+async def test_selection_can_be_cancelled_or_replaced(client, auth_a, gemini, say, make_task):
+    # Regression: during task selection, anything but a pick used to re-ask
+    # forever ("I'm not sure which one you mean"), trapping the user.
+    await make_task("Meeting with Bob")
+    await make_task("Meeting with Alice")
+    await make_task("Dentist")
+
+    gemini.append({"intent": "delete_task", "title": "meeting"})
+    await say("Delete meeting")
+    cancelled = await say("no")  # rule-based: no Gemini call
+    assert cancelled == {"reply": "Cancelled.", "state": "idle"}
+
+    gemini.append({"intent": "delete_task", "title": "meeting"})
+    await say("Delete meeting")
+    assert (await say("7"))["state"] == "awaiting_task_selection"  # out-of-range number re-asks
+    gemini.append({"intent": "delete_task", "title": "Dentist"})
+    switched = await say("actually, delete Dentist instead")  # treated as a new request
+    assert switched["state"] == "awaiting_confirmation"
+    assert '"Dentist"' in switched["reply"]
+    await say("yes")
+    assert await titles(client, auth_a) == ["Meeting with Alice", "Meeting with Bob"]
+
+
+async def test_create_warns_when_title_already_exists(client, auth_a, gemini, say, make_task):
+    # Guard for Gemini misreading "make X urgent" as create_task.
+    await make_task("Water the plants")
+    gemini.append({"intent": "create_task", "title": "Water the plants", "urgent": True})
+    reply = await say("Make Water the plants urgent")
+    assert reply["state"] == "awaiting_confirmation"
+    assert "already have a task" in reply["reply"]
+
+
 async def test_task_deleted_before_yes_gives_message_not_500(client, auth_a, gemini, say, make_task):
     # Regression for bug 5b.
     task = await make_task("Dentist")
@@ -136,3 +168,35 @@ async def test_other_user_has_separate_conversation(client, auth_b, gemini, say)
     response = await client.post("/assistant/message", json={"message": "yes"}, headers=auth_b)
     assert response.json()["state"] == "idle"  # B's "yes" didn't confirm A's action
     assert await titles(client, auth_b) == []
+
+
+async def test_lookup_matches_word_forms_and_filler_words(client, auth_a, gemini, say, make_task):
+    # Found by the reworded live run: "feeding the cat" didn't find "Feed the cat".
+    await make_task("Feed the cat")
+    await make_task("Renew passport")
+    gemini.append({"intent": "complete_task", "title": "feeding the cat"})
+    reply = await say("I finished feeding the cat")
+    assert reply["state"] == "awaiting_confirmation"
+    assert '"Feed the cat"' in reply["reply"]
+    await say("no")
+
+    gemini.append({"intent": "delete_task", "title": "passport wala task"})
+    reply = await say("passport wala task delete kar do")
+    assert '"Renew passport"' in reply["reply"]
+
+
+async def test_gemini_unavailable_says_busy_and_keeps_request(gemini, say):
+    gemini.append({"intent": "create_task", "title": None, "missing_fields": ["title"]})
+    assert (await say("Create a task"))["state"] == "collecting_information"
+    gemini.append(GeminiUnavailableError("ReadTimeout"))
+    reply = await say("the title should be Feed the cat")
+    assert "busy" in reply["reply"]
+    assert reply["state"] == "collecting_information"  # retry can continue
+
+
+async def test_cancel_handled_by_rules_without_gemini(gemini, say):
+    # No scripted Gemini answers: any Gemini call would fail this test.
+    assert (await say("cancel")) == {"reply": "Nothing to cancel.", "state": "idle"}
+    gemini.append({"intent": "create_task", "title": None, "missing_fields": ["title"]})
+    await say("Create a task")
+    assert (await say("never mind")) == {"reply": "Cancelled.", "state": "idle"}

@@ -142,3 +142,26 @@ def test_assistant_confirmation_mentions_task_and_due_date():
         state=ConversationState.IDLE, intent=Intent.CREATE_TASK, title="Buy milk", due_date=MON
     )
     assert _confirmation_message(pending) == 'Create a one-time task "Buy milk", due 2026-11-16. Confirm?'
+
+
+# --- assistant task lookup (pure, no DB) ---------------------------------------
+
+def test_task_lookup_is_deterministic_and_never_guesses():
+    from types import SimpleNamespace as T
+
+    from app.features.assistant.service import _match_tasks
+    from app.features.tasks.models import TaskStatus
+
+    tasks = [
+        T(title="Feed the cat", status=TaskStatus.PENDING),
+        T(title="Meeting with client", status=TaskStatus.PENDING),
+        T(title="Meeting with design team", status=TaskStatus.PENDING),
+        T(title="Old cat chore", status=TaskStatus.CANCELLED),
+    ]
+    titles = lambda q: [t.title for t in _match_tasks(tasks, q)]  # noqa: E731
+    assert titles("feeding the cat") == ["Feed the cat"]           # word form
+    assert titles("the cat task") == ["Feed the cat"]              # filler words; cancelled skipped
+    assert titles("meeting") == ["Meeting with client", "Meeting with design team"]  # several -> caller asks
+    assert titles("meetings with the client") == ["Meeting with client"]
+    assert titles("buy a spaceship") == []
+    assert titles("task") == []                                    # only filler -> no match

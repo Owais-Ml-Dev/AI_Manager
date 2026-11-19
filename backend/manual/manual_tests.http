@@ -1,0 +1,350 @@
+###############################################################################
+# AI Task Manager — manual test walkthrough
+#
+# Needs the VS Code "REST Client" extension (by Huachao Mao).
+#
+# SETUP (once):
+#   1. Your login lives in backend/manual/.env (git-ignored), NOT in this file:
+#        MANUAL_EMAIL=you@gmail.com
+#        MANUAL_PASSWORD=your-password
+#      Copy .env.example in this folder to .env if it's missing.
+#   2. Start the server (VS Code terminal, from the backend folder):
+#        .venv\Scripts\python -m uvicorn app.main:app --port 8001 --reload
+#
+# HOW IDs WORK — read this, it avoids confusing 404s:
+#   Requests after a "create" reuse the ID from the LAST click of that create
+#   (e.g. {{oneTime.response.body.$.id}} = whatever 2a returned last time).
+#   - Click each create (2a, 2b, 3d ...) ONCE.
+#   - Re-clicking a create makes a NEW task and moves the saved ID to it.
+#   - "Task N not found"? That saved ID's task is gone: click the matching
+#     create again, then continue. Section 8 lists/deletes leftover tasks.
+#   - Section 7 deletes the tasks the saved IDs point to — run it LAST.
+###############################################################################
+
+@baseUrl = http://127.0.0.1:8001
+@supabaseUrl = https://djbweuqndzoeikzbxgii.supabase.co
+@anonKey = sb_publishable_kpkvneQnc14P3DODcSmxHA_-I33IP5W
+@email = {{$dotenv MANUAL_EMAIL}}
+@password = {{$dotenv MANUAL_PASSWORD}}
+
+### 0. Health — expect database "ok" and redis "ok"
+GET {{baseUrl}}/health
+
+### 1a. Sign up (first time only; skip if the account exists)
+POST {{supabaseUrl}}/auth/v1/signup
+apikey: {{anonKey}}
+Content-Type: application/json
+
+{ "email": "{{email}}", "password": "{{password}}" }
+
+### 1b. Log in — every request below uses this token
+# @name login
+POST {{supabaseUrl}}/auth/v1/token?grant_type=password
+apikey: {{anonKey}}
+Content-Type: application/json
+
+{ "email": "{{email}}", "password": "{{password}}" }
+
+###
+@token = {{login.response.body.$.access_token}}
+
+### 1c. No token -> expect 401
+GET {{baseUrl}}/tasks
+
+
+###############################################################################
+# 2. TASKS — CRUD
+###############################################################################
+
+### 2a. Create a one-time task (urgent + important, due tomorrow — edit date)
+# @name oneTime
+POST {{baseUrl}}/tasks
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "title": "Buy a USB",
+  "category": "one_time",
+  "description": "32GB",
+  "urgent": true,
+  "important": true,
+  "due_date": "2026-11-20"
+}
+
+### 2b. Create a recurring task
+# @name recurring
+POST {{baseUrl}}/tasks
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "title": "Gym", "category": "recurring", "urgent": false, "important": true }
+
+### 2c. List your tasks
+GET {{baseUrl}}/tasks
+Authorization: Bearer {{token}}
+
+
+### 2d. Get one task
+GET {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}
+Authorization: Bearer {{token}}
+
+### 2e. Update (partial) — rename and change priority
+PATCH {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "title": "Buy a 64GB USB", "urgent": false }
+
+### 2f. Validation: null title -> expect 422 (not 500)
+PATCH {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "title": null }
+
+### 2g. Validation: due_date on a recurring task -> expect 422
+POST {{baseUrl}}/tasks
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "title": "x", "category": "recurring", "urgent": false, "important": false, "due_date": "2026-11-20" }
+
+### 2h. Complete, then reopen (both show up in history below)
+PATCH {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "status": "completed" }
+
+###
+PATCH {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "status": "pending" }
+
+### 2i. History — expect created, field_updated, priority_changed, status_changed, reopened
+GET {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/history
+Authorization: Bearer {{token}}
+
+### 2j. Eisenhower matrix
+GET {{baseUrl}}/tasks/matrix
+Authorization: Bearer {{token}}
+
+
+###############################################################################
+# 3. REMINDERS
+###############################################################################
+
+### 3a. One-time reminder config WITHOUT end_date -> expect 400
+PUT {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "start_date": "2026-11-18", "day_selection_type": "every_day" }
+
+### 3b. One-time reminder config (date range + weekdays only)
+PUT {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "start_date": "2026-11-18", "end_date": "2026-11-30", "day_selection_type": "weekdays" }
+
+### 3c. Recurring config: Mon/Wed/Fri, open-ended (no end_date)
+PUT {{baseUrl}}/tasks/{{recurring.response.body.$.id}}/reminder-config
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "start_date": "2026-11-16", "day_selection_type": "custom_weekdays", "custom_weekdays": [1, 3, 5] }
+
+### 3d. Add reminder times (try adding 19:00 twice -> second is 400)
+# @name time1
+POST {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config/reminder-times
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "time_of_day": "19:00:00" }
+
+###
+POST {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config/reminder-times
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "time_of_day": "19:15:00" }
+
+### 3e. List reminder times
+GET {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config/reminder-times
+Authorization: Bearer {{token}}
+
+### 3f. Scheduled deliveries — one per (eligible day x time), future only
+GET {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config/deliveries
+Authorization: Bearer {{token}}
+
+### 3g. Move 19:00 -> 18:45, then re-run 3f: no 19:00 deliveries remain
+PATCH {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config/reminder-times/{{time1.response.body.$.id}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "time_of_day": "18:45:00" }
+
+### 3h. Delete a reminder time
+DELETE {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/reminder-config/reminder-times/{{time1.response.body.$.id}}
+Authorization: Bearer {{token}}
+
+
+###############################################################################
+# 4. RECURRING OCCURRENCES
+###############################################################################
+
+### 4a. Occurrences (Mon/Wed/Fri). Past ones = "missed", today/future = "pending"
+# @name occ
+GET {{baseUrl}}/tasks/{{recurring.response.body.$.id}}/occurrences
+Authorization: Bearer {{token}}
+
+### 4b. Complete one occurrence (first in list). The TASK itself stays pending.
+# Note: only "pending" occurrences can change — if the first one is "missed",
+# copy a pending occurrence's id from 4a and put it in place of the expression.
+PATCH {{baseUrl}}/tasks/{{recurring.response.body.$.id}}/occurrences/{{occ.response.body.$[0].id}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "status": "completed" }
+
+### 4c. Occurrences on a one-time task -> expect 400
+GET {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/occurrences
+Authorization: Bearer {{token}}
+
+
+###############################################################################
+# 5. ANALYTICS
+###############################################################################
+
+### 5a. Dashboard
+GET {{baseUrl}}/dashboard
+Authorization: Bearer {{token}}
+
+### 5b. Per-task analytics (recurring: counts, %, monthly breakdown)
+GET {{baseUrl}}/tasks/{{recurring.response.body.$.id}}/analytics
+Authorization: Bearer {{token}}
+
+### 5c. Calendar — view: daily | weekly | monthly
+GET {{baseUrl}}/calendar?view=weekly&anchor_date=2026-11-18
+Authorization: Bearer {{token}}
+
+### 5d. Monthly report
+GET {{baseUrl}}/reports/monthly?year=2026&month=11
+Authorization: Bearer {{token}}
+
+
+###############################################################################
+# 6. AI ASSISTANT — send IN ORDER; watch "state" in each reply
+#    Gemini only turns your sentence into JSON. Nothing is written until you
+#    answer "yes" — and "yes"/"no"/numbers never even reach Gemini.
+###############################################################################
+
+### 6a. Create -> expect state "awaiting_confirmation", NO task created yet (check 2c)
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Create a task called Call the bank tomorrow" }
+
+### 6b. Confirm -> task is created now (check 2c)
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "yes" }
+
+### 6c. Missing info -> expect "What's the title?" (collecting_information)
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Create a task" }
+
+### 6d. Answer it -> expect confirmation question
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Call it Water the plants" }
+
+### 6e. Say no -> "Cancelled.", nothing created
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "no" }
+
+### 6f. Read-only — runs immediately, no confirmation
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Show my pending tasks" }
+
+###
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "What are my stats?" }
+
+### 6g. Complete / delete by name -> confirmation, then send 6b ("yes")
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Mark Call the bank as completed" }
+
+### 6h. Ambiguous name: create two "Meeting with ..." tasks first (2a style),
+# then this -> numbered list (awaiting_task_selection); reply "1" or "2", then "yes"
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "Delete meeting" }
+
+###
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "1" }
+
+### 6i. Not a task request -> polite "didn't understand", nothing happens
+POST {{baseUrl}}/assistant/message
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "message": "What's the weather today?" }
+
+
+###############################################################################
+# 7. CLEANUP — run LAST: deletes the tasks the saved IDs point to
+#    (their reminders, occurrences and history are deleted with them)
+###############################################################################
+
+###
+DELETE {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}
+Authorization: Bearer {{token}}
+
+###
+DELETE {{baseUrl}}/tasks/{{recurring.response.body.$.id}}
+Authorization: Bearer {{token}}
+
+
+###############################################################################
+# 8. FIX-UPS — when saved IDs get out of sync
+###############################################################################
+
+### 8a. Every task you own — find leftover/duplicate IDs here
+GET {{baseUrl}}/tasks
+Authorization: Bearer {{token}}
+
+### 8b. Delete any task by ID: set the number on the next line, then send
+@deleteId = 256
+
+DELETE {{baseUrl}}/tasks/{{deleteId}}
+Authorization: Bearer {{token}}

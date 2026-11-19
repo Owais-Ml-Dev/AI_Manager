@@ -25,6 +25,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env.test")
 from app.core.config import settings  # noqa: E402
 from app.core.database import AsyncSessionLocal  # noqa: E402
 from app.features.assistant import conversation_state  # noqa: E402
+from app.features.profile.models import UserSettings
 from app.features.tasks.models import Task  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -112,6 +113,8 @@ async def _wipe(user_ids) -> None:
     # history along with the tasks.
     async with AsyncSessionLocal() as session:
         await session.execute(sql_delete(Task).where(Task.user_id.in_(list(user_ids.values()))))
+        # Time-zone tests change a user's zone; reset to the default.
+        await session.execute(sql_delete(UserSettings).where(UserSettings.user_id.in_(list(user_ids.values()))))
         await session.commit()
     for user_id in user_ids.values():
         await conversation_state.clear_pending(user_id)

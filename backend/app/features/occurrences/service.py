@@ -17,12 +17,18 @@ from app.common.exceptions import NotFoundError, ValidationError
 from app.features.occurrences import repository
 from app.features.occurrences.models import Occurrence, OccurrenceStatus
 from app.features.reminders import repository as reminders_repository
+from app.core.timezones import user_today
 from app.features.reminders.service import ROLLING_HORIZON_DAYS, compute_eligible_dates, get_reminder_config
 from app.features.tasks.models import TaskCategory
 from app.features.tasks.service import get_task, list_tasks
 
 
-async def sync_occurrences(db: AsyncSession, task_id: int, user_id: uuid.UUID) -> list[Occurrence]:
+async def sync_occurrences(
+    db: AsyncSession, task_id: int, user_id: uuid.UUID, today: date | None = None
+) -> list[Occurrence]:
+    """Generates the task's occurrences up to the horizon and marks past
+    pending ones missed. "Today" is the OWNER'S local date (passed in by
+    callers that already know it, else looked up)."""
     task = await get_task(db, task_id, user_id)
     if task.category != TaskCategory.RECURRING:
         raise ValidationError("Occurrence tracking only applies to recurring tasks")
@@ -30,7 +36,7 @@ async def sync_occurrences(db: AsyncSession, task_id: int, user_id: uuid.UUID) -
     # raises NotFoundError if no reminder config set
     config = await get_reminder_config(db, task_id, user_id)
 
-    today = date.today()
+    today = today or await user_today(db, user_id)
     horizon = config.end_date if config.end_date else today + timedelta(days=ROLLING_HORIZON_DAYS)
 
     eligible = compute_eligible_dates(config, horizon)
@@ -51,13 +57,14 @@ async def sync_all_occurrences_for_user(db: AsyncSession, user_id: uuid.UUID) ->
     never hit. Recurring tasks without a reminder config yet are skipped.
     """
     tasks = await list_tasks(db, user_id)
+    today = await user_today(db, user_id)
     for task in tasks:
         if task.category != TaskCategory.RECURRING:
             continue
         config = await reminders_repository.get_by_task_id(db, task.id)
         if config is None:
             continue
-        await sync_occurrences(db, task.id, user_id)
+        await sync_occurrences(db, task.id, user_id, today=today)
 
 
 async def update_occurrence(

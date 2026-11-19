@@ -5,7 +5,7 @@ worker's generation/sweep logic. Real DB. Includes regression tests for:
   bug 4 — concurrent occurrence syncs must not 500 or duplicate rows.
 """
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -152,7 +152,7 @@ async def test_generation_skips_slots_already_in_the_past(client, auth_a, make_t
     await _generate(db, task["id"])
 
     generated = await deliveries(client, auth_a, task["id"])
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     assert generated, "future slots should still be generated"
     assert all(datetime.fromisoformat(d["scheduled_for"]) > now for d in generated)
 
@@ -195,7 +195,7 @@ async def _due_delivery(client, auth_a, make_task, db, title, minutes_ago):
     task = await make_task(title)
     await set_config(client, auth_a, task["id"], start_date=TODAY.isoformat(), end_date=TODAY.isoformat())
     time_id = (await add_time(client, auth_a, task["id"], "00:00:00"))["id"]
-    due = datetime.now() - timedelta(minutes=minutes_ago)
+    due = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
     await reminders_repository.bulk_create_deliveries(db, [(task["id"], time_id, due)])
     return task, due
 

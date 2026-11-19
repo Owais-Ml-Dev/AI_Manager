@@ -13,6 +13,7 @@ from app.core.database import Base
 # import feature models here so Base.metadata sees them for autogenerate
 from app.features.history.models import TaskHistoryEvent  # noqa: F401
 from app.features.occurrences.models import Occurrence  # noqa: F401
+from app.features.profile.models import UserSettings  # noqa: F401
 from app.features.reminders.models import ReminderConfig, ReminderTime  # noqa: F401
 from app.features.tasks.models import Task  # noqa: F401
 

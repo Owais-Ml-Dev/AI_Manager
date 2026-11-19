@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     def gemini_model_chain(self) -> list[str]:
         return [m.strip() for m in self.gemini_models.split(",") if m.strip()]
 
+    # Time zone for users who haven't set one yet (IANA name). The app sends
+    # the device's zone at login via PUT /me/settings.
+    default_timezone: str = "Asia/Kolkata"
+
     # Browser origins allowed to call this API (comma-separated), e.g.
     # "http://localhost:5173,https://app.example.com". Empty = no browser
     # origin allowed. Only browsers enforce CORS — the Android app, curl and

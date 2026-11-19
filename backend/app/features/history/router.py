@@ -4,6 +4,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timezones import user_zone
 from app.common.exceptions import NotFoundError
 from app.core.database import get_db
 from app.core.security import get_current_user_id
@@ -20,6 +21,12 @@ async def get_task_history(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
-        return await service.get_history(db, task_id, uuid.UUID(user_id))
+        events = await service.get_history(db, task_id, uuid.UUID(user_id))
+        # Stored in UTC; shown in the user's zone (same instant, local clock).
+        tz = await user_zone(db, uuid.UUID(user_id))
+        return [
+            TaskHistoryEventRead.model_validate(e).model_copy(update={"occurred_at": e.occurred_at.astimezone(tz)})
+            for e in events
+        ]
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

@@ -3,10 +3,10 @@ same backend services every other endpoint uses — the assistant has no
 special-cased write path. Called ONLY after explicit user confirmation
 (except the two read-only intents, which never write anything)."""
 import uuid
-from datetime import date
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timezones import user_today
 from app.features.assistant.schemas import PendingAction
 from app.features.dashboard import service as dashboard_service
 from app.features.occurrences import repository as occurrences_repository
@@ -60,7 +60,7 @@ async def execute_complete_task(db: AsyncSession, user_id: uuid.UUID, pending: P
         return f"Marked \"{task.title}\" as completed."
 
     # Recurring: completion is per-occurrence (today's), not the whole task.
-    occurrence = await occurrences_repository.get_by_task_and_date(db, task.id, date.today())
+    occurrence = await occurrences_repository.get_by_task_and_date(db, task.id, await user_today(db, user_id))
     if occurrence is None:
         return f"\"{task.title}\" has no scheduled occurrence for today."
     await update_occurrence(db, task.id, user_id, occurrence.id, OccurrenceStatus.COMPLETED)

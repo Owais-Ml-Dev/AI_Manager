@@ -94,7 +94,9 @@ class ReminderDelivery(Base):
         ForeignKey("reminder_times.id", ondelete="CASCADE")
     )
     # Naive (no timezone yet, same deferral as elsewhere) — date+time combined.
-    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=False))
+    # Absolute instant (UTC). Computed from the reminder time-of-day in the
+    # task owner's time zone (app.core.timezones.local_to_utc).
+    scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     status: Mapped[DeliveryStatus] = mapped_column(
         Enum(DeliveryStatus, name="delivery_status", native_enum=True),
         default=DeliveryStatus.SCHEDULED,

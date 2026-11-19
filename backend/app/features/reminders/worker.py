@@ -16,6 +16,7 @@ import logging
 from datetime import date
 
 from app.core.database import AsyncSessionLocal
+from app.core.timezones import now_utc
 from app.features.reminders.service import generate_all_deliveries, run_reminder_sweep
 
 logger = logging.getLogger("reminders.worker")
@@ -28,9 +29,11 @@ async def reminder_worker_loop() -> None:
     while True:
         try:
             async with AsyncSessionLocal() as db:
-                if generated_for != date.today():
+                # Once per UTC day: extend every task's 90-day horizon (each
+                # task is planned in its owner's zone inside generation).
+                if generated_for != now_utc().date():
                     await generate_all_deliveries(db)
-                    generated_for = date.today()
+                    generated_for = now_utc().date()
                 processed = await run_reminder_sweep(db)
                 if processed:
                     logger.info("Reminder sweep processed %d due deliveries", processed)

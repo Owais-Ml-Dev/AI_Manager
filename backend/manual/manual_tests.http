@@ -52,6 +52,19 @@ Content-Type: application/json
 GET {{baseUrl}}/tasks
 
 
+### 1d. Your time zone (default Asia/Kolkata until the app sends one)
+GET {{baseUrl}}/me/settings
+Authorization: Bearer {{token}}
+
+### 1e. Set it, as the Android app will at login (ZoneId.systemDefault().id).
+# Upcoming reminders are re-planned in the new zone. "IST"/"EST" -> 422.
+PUT {{baseUrl}}/me/settings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "timezone": "Asia/Kolkata" }
+
+
 ###############################################################################
 # 2. TASKS — CRUD
 ###############################################################################

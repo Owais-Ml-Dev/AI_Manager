@@ -14,6 +14,7 @@ from app.features.assistant.router import router as assistant_router
 from app.features.dashboard.router import analytics_router, calendar_router, router as dashboard_router
 from app.features.history.router import router as history_router
 from app.features.occurrences.router import router as occurrences_router
+from app.features.profile.router import router as profile_router
 from app.features.reminders.router import router as reminders_router
 from app.features.reminders.worker import reminder_worker_loop
 from app.features.reports.router import router as reports_router
@@ -55,6 +56,7 @@ app.include_router(analytics_router)
 app.include_router(calendar_router)
 app.include_router(reports_router)
 app.include_router(assistant_router)
+app.include_router(profile_router)
 
 
 @app.get("/health")

@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exceptions import NotFoundError, ValidationError
 from app.core.notifications import send_reminder_notification
+from app.core.timezones import local_to_utc, now_utc, task_owner_zone, today_in
 from app.features.history import service as history_service
 from app.features.reminders import repository
 from app.features.reminders.models import (
@@ -99,8 +100,9 @@ async def set_reminder_config(
         # Past/resolved records stay as history.
         from app.features.occurrences import repository as occurrences_repository
 
-        await repository.delete_future_scheduled_deliveries(db, task_id, datetime.now())
-        await occurrences_repository.delete_future_pending(db, task_id, date.today())
+        tz = await task_owner_zone(db, task_id)
+        await repository.delete_future_scheduled_deliveries(db, task_id, now_utc())
+        await occurrences_repository.delete_future_pending(db, task_id, today_in(tz))
 
     await _generate_deliveries_for_task(db, task_id, config)
     await history_service.record_schedule_change(db, task_id, old_summary, _summarize(config))
@@ -154,7 +156,7 @@ async def update_reminder_time(
     updated = await repository.update_time(db, reminder_time, time_of_day)
     # Upcoming deliveries were generated at the old time; drop and regenerate
     # them, or they'd still fire at the old time.
-    await repository.delete_future_scheduled_for_time(db, updated.id, datetime.now())
+    await repository.delete_future_scheduled_for_time(db, updated.id, now_utc())
     await generate_deliveries_for_task(db, task_id)
     return updated
 
@@ -178,7 +180,10 @@ async def _generate_deliveries_for_task(db: AsyncSession, task_id: int, config: 
     if not times:
         return
 
-    today = date.today()
+    # Dates and times-of-day are the owner's LOCAL calendar; each slot is
+    # stored as the absolute UTC instant of that local date+time.
+    tz = await task_owner_zone(db, task_id)
+    today = today_in(tz)
     horizon = config.end_date if config.end_date else today + timedelta(days=ROLLING_HORIZON_DAYS)
     eligible_dates = compute_eligible_dates(config, horizon)
 
@@ -189,12 +194,12 @@ async def _generate_deliveries_for_task(db: AsyncSession, task_id: int, config: 
     # config/time change, and daily for the rolling horizon), so no
     # legitimately upcoming slot is ever skipped by this. Existing slots are
     # skipped by the insert itself (ON CONFLICT DO NOTHING).
-    now = datetime.now()
+    now = now_utc()
     rows = [
         (task_id, t.id, slot)
         for d in eligible_dates
         for t in times
-        if (slot := datetime.combine(d, t.time_of_day)) > now
+        if (slot := local_to_utc(d, t.time_of_day, tz)) > now
     ]
     await repository.bulk_create_deliveries(db, rows)
 
@@ -240,9 +245,10 @@ async def run_reminder_sweep(db: AsyncSession) -> int:
     from app.features.tasks import repository as tasks_repository
     from app.features.tasks.models import TaskStatus
 
-    now = datetime.now()
+    now = now_utc()
     due = await repository.list_due_scheduled(db, now, limit=SWEEP_BATCH_LIMIT)
     processed = 0
+    zones: dict[int, object] = {}  # task_id -> owner's zone, looked up once per sweep
 
     for delivery in due:
         task = await tasks_repository.get(db, delivery.task_id)
@@ -255,9 +261,11 @@ async def run_reminder_sweep(db: AsyncSession) -> int:
         if not should_cancel and task.category == TaskCategory.ONE_TIME:
             should_cancel = task.status == TaskStatus.COMPLETED
         elif not should_cancel and task.category == TaskCategory.RECURRING:
-            occurrence = await occurrences_repository.get_by_task_and_date(
-                db, task.id, delivery.scheduled_for.date()
-            )
+            if task.id not in zones:
+                zones[task.id] = await task_owner_zone(db, task.id)
+            # The occurrence is the owner's LOCAL date of this delivery.
+            local_date = delivery.scheduled_for.astimezone(zones[task.id]).date()
+            occurrence = await occurrences_repository.get_by_task_and_date(db, task.id, local_date)
             should_cancel = occurrence is not None and occurrence.status in (
                 OccurrenceStatus.COMPLETED,
                 OccurrenceStatus.SKIPPED,

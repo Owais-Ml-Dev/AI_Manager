@@ -4,6 +4,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timezones import user_zone
 from app.common.exceptions import NotFoundError, ValidationError
 from app.core.database import get_db
 from app.core.security import get_current_user_id
@@ -113,6 +114,15 @@ async def list_deliveries(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
-        return await service.list_deliveries(db, task_id, uuid.UUID(user_id))
+        deliveries = await service.list_deliveries(db, task_id, uuid.UUID(user_id))
+        # Stored in UTC; shown in the user's zone (same instant, local clock).
+        tz = await user_zone(db, uuid.UUID(user_id))
+        return [
+            ReminderDeliveryRead.model_validate(d).model_copy(update={
+                "scheduled_for": d.scheduled_for.astimezone(tz),
+                "sent_at": d.sent_at.astimezone(tz) if d.sent_at else None,
+            })
+            for d in deliveries
+        ]
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

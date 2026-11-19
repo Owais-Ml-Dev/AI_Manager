@@ -7,6 +7,7 @@ from datetime import date, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timezones import user_today
 from app.features.dashboard import repository
 from app.features.dashboard.schemas import (
     CalendarActivity,
@@ -28,7 +29,7 @@ from app.features.tasks.service import get_task
 
 
 async def get_dashboard(db: AsyncSession, user_id: uuid.UUID) -> DashboardRead:
-    counts = await repository.get_counts(db, user_id, today=date.today())
+    counts = await repository.get_counts(db, user_id, today=await user_today(db, user_id))
 
     # Overall completion % = (completed one-time tasks + completed occurrences)
     # / (eligible one-time tasks + eligible occurrences). "Eligible" excludes
@@ -81,7 +82,7 @@ async def get_task_analytics(db: AsyncSession, task_id: int, user_id: uuid.UUID)
     base.day_selection_type = config.day_selection_type
 
     occurrences = await occurrences_repository.list_by_task(db, task.id)
-    today = date.today()
+    today = await user_today(db, user_id)
 
     base.total_scheduled_occurrences = len(occurrences)
     base.completed_occurrences = sum(1 for o in occurrences if o.status == OccurrenceStatus.COMPLETED)

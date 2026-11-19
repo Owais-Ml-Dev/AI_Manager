@@ -6,6 +6,7 @@ from datetime import date, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timezones import user_today
 from app.features.occurrences.models import OccurrenceStatus
 from app.features.reports import repository
 from app.features.reports.schemas import (
@@ -42,7 +43,7 @@ async def get_monthly_report(
     db: AsyncSession, user_id: uuid.UUID, year: int, month: int
 ) -> MonthlyReportRead:
     start, end = _month_range(year, month)
-    today = date.today()
+    today = await user_today(db, user_id)
 
     # --- A. One-time task performance ---
     one_time_tasks = await repository.get_one_time_tasks_due_in_month(db, user_id, start, end)

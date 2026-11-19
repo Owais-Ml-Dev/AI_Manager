@@ -1,9 +1,11 @@
 """Business logic for tasks."""
 import uuid
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
 
 from app.common.exceptions import NotFoundError, ValidationError
 from app.features.history import service as history_service
@@ -115,11 +117,11 @@ async def get_matrix(
 async def sync_overdue(db: AsyncSession) -> None:
     """Flips PENDING one-time tasks past their due date/time to OVERDUE.
 
-    Runs across all users (maintenance sweep, not a per-request user action).
-    Deadline policy (consistent with occurrences' missed-detection): a task
-    with only a due_date is overdue starting the day AFTER that date (the
-    whole due date still counts as on-time). A task with a due_time is
-    overdue once that exact date+time has passed.
+    Runs across all users (maintenance sweep, not a per-request user action),
+    each judged in their own time zone. Deadline policy (consistent with
+    occurrences' missed-detection): a task with only a due_date is overdue
+    starting the day AFTER that date (the whole due date still counts as
+    on-time). A task with a due_time is overdue once that exact local
+    date+time has passed.
     """
-    now = datetime.now()
-    await repository.mark_overdue(db, today=now.date(), now_time=now.time())
+    await repository.mark_overdue(db, default_timezone=settings.default_timezone)

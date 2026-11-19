@@ -5,6 +5,7 @@ from datetime import date
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timezones import user_today
 from app.common.exceptions import NotFoundError
 from app.core.database import get_db
 from app.core.security import get_current_user_id
@@ -58,4 +59,4 @@ async def get_calendar(
     uid = uuid.UUID(user_id)
     await sync_overdue(db)
     await sync_all_occurrences_for_user(db, uid)
-    return await service.get_calendar(db, uid, view, anchor_date or date.today())
+    return await service.get_calendar(db, uid, view, anchor_date or await user_today(db, uid))

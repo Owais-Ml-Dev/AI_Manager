@@ -17,6 +17,7 @@ import uuid
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.timezones import user_today
 from app.core.gemini import (
     GeminiError,
     GeminiQuotaExhaustedError,
@@ -158,8 +159,12 @@ def _apply_gemini_output(pending: PendingAction, parsed: GeminiIntentOutput) -> 
     return PendingAction(**data)
 
 
-async def _build_prompt(message: str, pending: PendingAction) -> str:
-    from datetime import date
+async def _build_prompt(message: str, pending: PendingAction, today=None) -> str:
+    """`today` is the USER'S local date, so \"tomorrow\" resolves in their zone
+    (defaults to today in the default zone, for scripts that build prompts)."""
+    from app.core.timezones import default_zone, today_in
+
+    today = today or today_in(default_zone())
 
     known = {
         k: v
@@ -206,7 +211,7 @@ How to choose the intent:
   - "delete X", "remove X" -> delete_task
 - The user may write in any language (e.g. Hindi/Hinglish); keep the task title in the user's words.
 
-Today's date is {date.today().isoformat()}.
+Today's date is {today.isoformat()}.
 {context}
 Never invent a value you're not confident about — use null and list it in missing_fields instead.
 If the message doesn't match a supported task-management operation, use intent "unknown".
@@ -290,7 +295,7 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
         )
 
     # --- Gemini call (fresh message, or filling in missing fields) ---
-    prompt = await _build_prompt(message, pending)
+    prompt = await _build_prompt(message, pending, today=await user_today(db, user_id))
     try:
         raw = await generate_json(prompt)
         parsed = GeminiIntentOutput.model_validate(raw)

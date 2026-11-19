@@ -3,10 +3,9 @@ import uuid
 from datetime import date, time
 from typing import Any
 
-from sqlalchemy import and_, or_
+from sqlalchemy import text
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
-from sqlalchemy import update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.features.tasks.models import Task, TaskCategory, TaskStatus
@@ -61,25 +60,25 @@ async def delete(db: AsyncSession, task: Task) -> None:
     await db.commit()
 
 
-async def mark_overdue(db: AsyncSession, today: date, now_time: time) -> None:
-    """A task is overdue once its due date is in the past, or (if it has a
-    due_time) once that exact date+time has passed today. Runs across all
-    users — this is maintenance housekeeping, not a per-request user action."""
+async def mark_overdue(db: AsyncSession, default_timezone: str) -> None:
+    """Flips PENDING one-time tasks past their deadline to OVERDUE, judged in
+    EACH OWNER'S local time (user_settings.timezone, else default_timezone):
+    a date-only task is overdue from local midnight after its due date
+    (due_date + 24:00); with a due_time, once that local date+time passes.
+    One statement for all users — Postgres converts now() into each owner's
+    zone, so this stays a single query however many users there are."""
     await db.execute(
-        sql_update(Task)
-        .where(
-            Task.category == TaskCategory.ONE_TIME,
-            Task.status == TaskStatus.PENDING,
-            Task.due_date.is_not(None),
-            or_(
-                Task.due_date < today,
-                and_(
-                    Task.due_date == today,
-                    Task.due_time.is_not(None),
-                    Task.due_time < now_time,
-                ),
-            ),
-        )
-        .values(status=TaskStatus.OVERDUE)
+        text("""
+            UPDATE tasks AS t
+               SET status = 'OVERDUE', updated_at = now()
+             WHERE t.category = 'ONE_TIME'
+               AND t.status = 'PENDING'
+               AND t.due_date IS NOT NULL
+               AND (t.due_date + COALESCE(t.due_time, TIME '24:00'))
+                   < (now() AT TIME ZONE COALESCE(
+                        (SELECT us.timezone FROM user_settings us WHERE us.user_id = t.user_id),
+                        :default_tz))
+        """),
+        {"default_tz": default_timezone},
     )
     await db.commit()

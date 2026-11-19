@@ -38,10 +38,9 @@ async def set_timezone(db: AsyncSession, user_id: uuid.UUID, tz_name: str) -> Us
             set_={"timezone": tz_name, "updated_at": now_utc()},
         )
     )
-    await db.commit()
-
     if tz_name != previous:
         await _replan_reminders(db, user_id)
+    await db.commit()  # zone + re-planned reminders saved together
     return UserSettingsRead(timezone=tz_name, is_default=False)
 
 

@@ -23,7 +23,7 @@ async def create_event(
         new_value=new_value,
     )
     db.add(event)
-    await db.commit()
+    await db.flush()
     await db.refresh(event)
     return event
 

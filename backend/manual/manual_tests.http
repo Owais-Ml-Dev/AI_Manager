@@ -137,7 +137,17 @@ Content-Type: application/json
 { "status": "pending" }
 
 ### 2i. History — expect created, field_updated, priority_changed, status_changed, reopened
+# (after 2k/2l also: paused, resumed; the worker adds became_overdue / occurrence_missed)
 GET {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/history
+Authorization: Bearer {{token}}
+
+### 2k. Pause (no reminders, never overdue, recurring days skipped not missed)
+POST {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/pause
+Authorization: Bearer {{token}}
+
+### 2l. Resume. If the due date passed while paused -> 409 "new_due_date_required";
+# then resend with a body:  { "due_date": "2026-12-01" }
+POST {{baseUrl}}/tasks/{{oneTime.response.body.$.id}}/resume
 Authorization: Bearer {{token}}
 
 ### 2j. Eisenhower matrix

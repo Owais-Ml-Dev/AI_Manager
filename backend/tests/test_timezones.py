@@ -65,13 +65,14 @@ async def test_settings_default_then_set_per_user(client, auth_a, auth_b):
 
 # --- overdue, occurrences, reminders in the owner's zone ---------------------------------
 
-async def test_overdue_is_judged_in_each_owners_zone(client, auth_a, auth_b, make_task):
+async def test_overdue_is_judged_in_each_owners_zone(client, auth_a, auth_b, make_task, run_maintenance):
     await set_tz(client, auth_a, KIRITIMATI)
     await set_tz(client, auth_b, PAGO)
     due = local_today(PAGO).isoformat()  # Pago's today = always before Kiritimati's today
     a_task = await make_task("A due", due_date=due)
     b_task = await make_task("B due", due_date=due, headers=auth_b)
 
+    await run_maintenance()
     statuses = {t["id"]: t["status"] for t in (await client.get("/tasks", headers=auth_a)).json()}
     assert statuses[a_task["id"]] == "overdue"      # past date in Kiritimati
     b = (await client.get(f"/tasks/{b_task['id']}", headers=auth_b)).json()
@@ -81,6 +82,7 @@ async def test_overdue_is_judged_in_each_owners_zone(client, auth_a, auth_b, mak
     today_a = local_today(KIRITIMATI).isoformat()
     passed = await make_task("A passed", due_date=today_a, due_time="00:00:00")
     later = await make_task("A later", due_date=today_a, due_time="23:59:59")
+    await run_maintenance()
     statuses = {t["id"]: t["status"] for t in (await client.get("/tasks", headers=auth_a)).json()}
     assert statuses[passed["id"]] == "overdue" and statuses[later["id"]] == "pending"
 
@@ -144,6 +146,7 @@ async def test_sweep_matches_occurrence_by_owners_local_date(client, auth_a, mak
 
     due = datetime.now(timezone.utc) - timedelta(minutes=1)
     await reminders_repository.bulk_create_deliveries(db, [(task["id"], time_id, due)])
+    await db.commit()
     db.expire_all()
     await reminders_service.run_reminder_sweep(db)
 

@@ -59,7 +59,7 @@ async def test_due_date_on_recurring_rejected(client, auth_a):
     assert (await client.post("/tasks", json=payload, headers=auth_a)).status_code == 422
 
 
-async def test_overdue_detection(client, auth_a, make_task):
+async def test_overdue_detection(client, auth_a, make_task, run_maintenance):
     yesterday = (date.today() - timedelta(days=1)).isoformat()
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
     late = await make_task("late", due_date=yesterday)
@@ -67,6 +67,7 @@ async def test_overdue_detection(client, auth_a, make_task):
     future = await make_task("future", due_date=tomorrow)
 
     status = lambda t: t["status"]  # noqa: E731
+    await run_maintenance()  # the worker's job; GET /tasks only reads
     tasks = {t["id"]: t for t in (await client.get("/tasks", headers=auth_a)).json()}
     assert status(tasks[late["id"]]) == "overdue"
     assert status(tasks[today_all_day["id"]]) == "pending"  # whole due date counts as on time

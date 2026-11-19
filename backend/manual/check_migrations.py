@@ -49,9 +49,13 @@ async def snapshot(engine) -> dict:
     async with engine.connect() as c:
         tables = set((await c.execute(text(
             "select tablename from pg_tables where schemaname='public'"))).scalars())
-        enums = set((await c.execute(text(
-            "select typname from pg_type t join pg_namespace n on n.oid=t.typnamespace "
-            "where n.nspname='public' and t.typtype='e'"))).scalars())
+        enum_rows = (await c.execute(text(
+            "select t.typname, e.enumlabel from pg_type t join pg_namespace n on n.oid=t.typnamespace "
+            "join pg_enum e on e.enumtypid = t.oid where n.nspname='public' order by t.typname, e.enumsortorder"
+        ))).all()
+        enums = {}
+        for name, label in enum_rows:
+            enums.setdefault(name, []).append(label)
         fks = set((await c.execute(text(
             "select conname from pg_constraint where contype='f' and connamespace='public'::regnamespace"
         ))).scalars())
@@ -76,7 +80,7 @@ async def main() -> None:
 
         alembic("upgrade", "head")
         up = await snapshot(scratch)
-        print(f"  after upgrade: {len(up['tables'])} tables, enums {sorted(up['enums'])}, "
+        print(f"  after upgrade: {len(up['tables'])} tables, enums {dict((k, len(v)) for k, v in sorted(up['enums'].items()))}, "
               f"FKs incl. tasks_user_id_fkey={'tasks_user_id_fkey' in up['fks']}, "
               f"status default {up['status_default']}")
         if "tasks_user_id_fkey" not in up["fks"]:
@@ -87,7 +91,7 @@ async def main() -> None:
         alembic("downgrade", "base")
         down = await snapshot(scratch)
         leftover_tables = down["tables"] - {"alembic_version"}
-        leftover_enums = down["enums"]  # every custom type must be gone, not just a known list
+        leftover_enums = set(down["enums"])  # every custom type must be gone, not just a known list
         print(f"  after downgrade: leftover tables {sorted(leftover_tables) or 'none'}, "
               f"leftover enums {sorted(leftover_enums) or 'none'}")
         if leftover_tables:

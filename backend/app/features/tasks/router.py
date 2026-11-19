@@ -1,4 +1,6 @@
-"""HTTP endpoints for tasks (create, list, get, update, delete)."""
+"""HTTP endpoints for tasks (create, list, get, update, delete, pause, resume).
+GET endpoints only read; time-driven changes (overdue, missed) are made by the
+background worker (app.features.maintenance)."""
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,7 +11,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user_id
 from app.features.tasks import service
 from app.features.tasks.models import TaskCategory, TaskStatus
-from app.features.tasks.schemas import MatrixRead, QuadrantGroup, TaskCreate, TaskRead, TaskUpdate
+from app.features.tasks.schemas import MatrixRead, QuadrantGroup, TaskCreate, TaskRead, TaskResume, TaskUpdate
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -37,7 +39,6 @@ async def create_task(
 async def list_tasks(
     db: AsyncSession = Depends(get_db), user_id: str = Depends(get_current_user_id)
 ):
-    await service.sync_overdue(db)
     return await service.list_tasks(db, uuid.UUID(user_id))
 
 
@@ -47,7 +48,6 @@ async def get_matrix(
     db: AsyncSession = Depends(get_db),
     user_id: str = Depends(get_current_user_id),
 ):
-    await service.sync_overdue(db)
     groups = await service.get_matrix(db, uuid.UUID(user_id), category)
     return {
         key: QuadrantGroup(
@@ -66,7 +66,6 @@ async def get_task(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
-        await service.sync_overdue(db)
         return await service.get_task(db, task_id, uuid.UUID(user_id))
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -99,3 +98,36 @@ async def delete_task(
         await service.delete_task(db, task_id, uuid.UUID(user_id))
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{task_id}/pause", response_model=TaskRead)
+async def pause_task(
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        return await service.pause_task(db, task_id, uuid.UUID(user_id))
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/{task_id}/resume", response_model=TaskRead)
+async def resume_task(
+    task_id: int,
+    payload: TaskResume | None = None,
+    db: AsyncSession = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    body = payload or TaskResume()
+    try:
+        return await service.resume_task(db, task_id, uuid.UUID(user_id), body.due_date, body.due_time)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except service.NewDueDateRequired as exc:
+        # Machine-readable so the app knows to show a date picker.
+        raise HTTPException(status_code=409, detail={"code": "new_due_date_required", "message": str(exc)}) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

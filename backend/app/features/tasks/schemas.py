@@ -45,6 +45,13 @@ class TaskUpdate(BaseModel):
         return value
 
 
+class TaskResume(BaseModel):
+    """Body for POST /tasks/{id}/resume. Needed only when a one-time task's
+    due date passed while it was paused (then due_date is required)."""
+    due_date: date | None = None
+    due_time: time | None = None
+
+
 class TaskRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

@@ -46,7 +46,8 @@ async def get_counts(db: AsyncSession, user_id: uuid.UUID, today: date) -> dict[
     )
     # "Eligible" one-time tasks exclude cancelled ones from the completion-rate denominator.
     eligible_one_time_tasks = await _count_tasks(
-        db, user_id, Task.category == TaskCategory.ONE_TIME, Task.status != TaskStatus.CANCELLED
+        db, user_id, Task.category == TaskCategory.ONE_TIME,
+        Task.status.notin_([TaskStatus.CANCELLED, TaskStatus.PAUSED]),  # a pause doesn't hurt stats
     )
 
     today_scheduled_occurrences = await _count_occurrences(

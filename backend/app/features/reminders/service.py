@@ -96,16 +96,23 @@ async def set_reminder_config(
     if existing is not None:
         # The schedule changed: anything already generated for the future
         # under the old schedule is now wrong. Clear it so it regenerates
-        # from the new one (occurrences on next sync, deliveries right below).
-        # Past/resolved records stay as history.
+        # from the new one (just below). Past/resolved records stay as history.
         from app.features.occurrences import repository as occurrences_repository
 
-        tz = await task_owner_zone(db, task_id)
         await repository.delete_future_scheduled_deliveries(db, task_id, now_utc())
-        await occurrences_repository.delete_future_pending(db, task_id, today_in(tz))
+        await occurrences_repository.delete_future_pending(db, task_id, today_in(await task_owner_zone(db, task_id)))
+
+    # Generate everything for the new schedule now, in this same save:
+    # deliveries, recurring occurrences, and the time-based statuses of any
+    # days already past (a start_date in the past) — so reads never need to.
+    from app.features.maintenance.service import apply_time_based_changes
+    from app.features.occurrences.service import generate_occurrences
 
     await _generate_deliveries_for_task(db, task_id, config)
+    await generate_occurrences(db, task_id, today_in(await task_owner_zone(db, task_id)))
+    await apply_time_based_changes(db, task_id)
     await history_service.record_schedule_change(db, task_id, old_summary, _summarize(config))
+    await db.commit()
     return config
 
 
@@ -132,6 +139,7 @@ async def add_reminder_time(
         raise ValidationError(f"Reminder time {time_of_day} already exists for this task")
     reminder_time = await repository.create_time(db, config.id, time_of_day)
     await _generate_deliveries_for_task(db, task_id, config)
+    await db.commit()
     return reminder_time
 
 
@@ -158,6 +166,7 @@ async def update_reminder_time(
     # them, or they'd still fire at the old time.
     await repository.delete_future_scheduled_for_time(db, updated.id, now_utc())
     await generate_deliveries_for_task(db, task_id)
+    await db.commit()
     return updated
 
 
@@ -166,6 +175,7 @@ async def delete_reminder_time(
 ) -> None:
     reminder_time = await _get_owned_reminder_time(db, task_id, user_id, time_id)
     await repository.delete_time(db, reminder_time)
+    await db.commit()
 
 
 async def list_deliveries(
@@ -176,6 +186,13 @@ async def list_deliveries(
 
 
 async def _generate_deliveries_for_task(db: AsyncSession, task_id: int, config: ReminderConfig) -> None:
+    """Does not commit (callers own the transaction)."""
+    from app.features.tasks import repository as tasks_repository
+    from app.features.tasks.models import TaskStatus
+
+    task = await tasks_repository.get(db, task_id)
+    if task is None or task.status == TaskStatus.PAUSED:
+        return  # paused: no reminders until resumed (resume regenerates)
     times = await repository.list_times(db, config.id)
     if not times:
         return
@@ -213,14 +230,6 @@ async def generate_deliveries_for_task(db: AsyncSession, task_id: int) -> None:
         await _generate_deliveries_for_task(db, task_id, config)
 
 
-async def generate_all_deliveries(db: AsyncSession) -> None:
-    """Extends every task's rolling horizon. The worker calls this once a day
-    (and at startup), not every sweep: changes regenerate immediately via
-    generate_deliveries_for_task, so only the date rolling over adds slots."""
-    for task_id in await repository.list_task_ids_with_config(db):
-        await generate_deliveries_for_task(db, task_id)
-
-
 # A sweep processes at most this many due deliveries; the rest wait for the
 # next sweep, so a backlog after downtime can't turn into one huge batch.
 SWEEP_BATCH_LIMIT = 500
@@ -255,7 +264,7 @@ async def run_reminder_sweep(db: AsyncSession) -> int:
 
         should_cancel = (
             task is None
-            or task.status == TaskStatus.CANCELLED
+            or task.status in (TaskStatus.CANCELLED, TaskStatus.PAUSED)
             or now - delivery.scheduled_for > STALE_AFTER
         )
         if not should_cancel and task.category == TaskCategory.ONE_TIME:

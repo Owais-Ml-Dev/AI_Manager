@@ -25,7 +25,7 @@ async def list_occurrences(
     user_id: str = Depends(get_current_user_id),
 ):
     try:
-        return await service.sync_occurrences(db, task_id, uuid.UUID(user_id))
+        return await service.list_occurrences(db, task_id, uuid.UUID(user_id))
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValidationError as exc:

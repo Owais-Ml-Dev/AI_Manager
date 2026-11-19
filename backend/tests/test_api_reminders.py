@@ -197,6 +197,7 @@ async def _due_delivery(client, auth_a, make_task, db, title, minutes_ago):
     time_id = (await add_time(client, auth_a, task["id"], "00:00:00"))["id"]
     due = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
     await reminders_repository.bulk_create_deliveries(db, [(task["id"], time_id, due)])
+    await db.commit()  # repositories only stage; other sessions must see it
     return task, due
 
 

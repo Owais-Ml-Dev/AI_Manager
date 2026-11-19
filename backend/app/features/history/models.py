@@ -20,6 +20,12 @@ class HistoryEventType(str, enum.Enum):
     STATUS_CHANGED = "status_changed"
     REOPENED = "reopened"
     SCHEDULE_CHANGED = "schedule_changed"
+    # Recorded automatically by the background worker:
+    BECAME_OVERDUE = "became_overdue"
+    OCCURRENCE_MISSED = "occurrence_missed"  # old_value = the occurrence date
+    # Recorded by pause/resume:
+    PAUSED = "paused"
+    RESUMED = "resumed"
 
 
 class TaskHistoryEvent(Base):

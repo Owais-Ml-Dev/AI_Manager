@@ -135,6 +135,19 @@ async def db():
 
 
 @pytest.fixture
+def run_maintenance():
+    """Runs the background worker's time-driven step (overdue, missed,
+    paused days skipped) once, as the worker would — GETs no longer do it."""
+    from app.features.maintenance.service import run_maintenance as _run
+
+    async def _go():
+        async with AsyncSessionLocal() as session:
+            return await _run(session)
+
+    return _go
+
+
+@pytest.fixture
 def make_task(client, auth_a):
     """Factory: creates a task as user A (or `headers=`) and returns its JSON."""
 

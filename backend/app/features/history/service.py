@@ -1,6 +1,9 @@
 """Recording helpers called by other features as a side effect of their own
-writes (task create/update, schedule replace), plus the read path for a
-task's history.
+writes (task create/update/pause/resume, schedule replace), plus the read
+path for a task's history. Helpers only stage the event: it is saved in the
+same commit as the change it describes, so a change is never stored without
+its history (or vice versa). Time-driven events (became_overdue,
+occurrence_missed) are written by app.features.maintenance.
 """
 import uuid
 
@@ -44,6 +47,14 @@ async def record_status_change(db: AsyncSession, task_id: int, old_status, new_s
     await repository.create_event(
         db, task_id, event_type, "status", old_status.value, new_status.value
     )
+
+
+async def record_paused(db: AsyncSession, task_id: int, old_status) -> None:
+    await repository.create_event(db, task_id, HistoryEventType.PAUSED, "status", old_status.value, "paused")
+
+
+async def record_resumed(db: AsyncSession, task_id: int) -> None:
+    await repository.create_event(db, task_id, HistoryEventType.RESUMED, "status", "paused", "pending")
 
 
 async def record_schedule_change(

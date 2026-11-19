@@ -26,7 +26,7 @@ async def upsert(db: AsyncSession, task_id: int, data: ReminderConfigWrite) -> R
         config = ReminderConfig(task_id=task_id, **data.model_dump())
         db.add(config)
 
-    await db.commit()
+    await db.flush()
     await db.refresh(config)
     return config
 
@@ -61,7 +61,7 @@ async def create_time(
 ) -> ReminderTime:
     reminder_time = ReminderTime(reminder_config_id=reminder_config_id, time_of_day=time_of_day)
     db.add(reminder_time)
-    await db.commit()
+    await db.flush()
     await db.refresh(reminder_time)
     return reminder_time
 
@@ -70,14 +70,14 @@ async def update_time(
     db: AsyncSession, reminder_time: ReminderTime, time_of_day: dt.time
 ) -> ReminderTime:
     reminder_time.time_of_day = time_of_day
-    await db.commit()
+    await db.flush()
     await db.refresh(reminder_time)
     return reminder_time
 
 
 async def delete_time(db: AsyncSession, reminder_time: ReminderTime) -> None:
     await db.delete(reminder_time)
-    await db.commit()
+    await db.flush()
 
 
 async def list_task_ids_with_config(db: AsyncSession) -> list[int]:
@@ -115,7 +115,7 @@ async def bulk_create_deliveries(
         )
         .on_conflict_do_nothing(index_elements=["reminder_time_id", "scheduled_for"])
     )
-    await db.commit()
+    await db.flush()
 
 
 async def delete_future_scheduled_for_time(
@@ -130,7 +130,7 @@ async def delete_future_scheduled_for_time(
             ReminderDelivery.scheduled_for > now,
         )
     )
-    await db.commit()
+    await db.flush()
 
 
 async def delete_future_scheduled_deliveries(db: AsyncSession, task_id: int, now: dt.datetime) -> None:
@@ -144,7 +144,7 @@ async def delete_future_scheduled_deliveries(db: AsyncSession, task_id: int, now
             ReminderDelivery.scheduled_for > now,
         )
     )
-    await db.commit()
+    await db.flush()
 
 
 async def list_due_scheduled(

@@ -20,6 +20,9 @@ class TaskStatus(str, enum.Enum):
     COMPLETED = "completed"
     OVERDUE = "overdue"
     CANCELLED = "cancelled"
+    # Temporarily on hold: no reminders, never becomes overdue, its recurring
+    # days are skipped (not missed). Only via POST /tasks/{id}/pause|resume.
+    PAUSED = "paused"
 
 
 class Task(Base):

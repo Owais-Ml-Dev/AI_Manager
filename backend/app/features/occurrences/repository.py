@@ -53,7 +53,7 @@ async def bulk_create(db: AsyncSession, task_id: int, dates: list[date]) -> None
         )
         .on_conflict_do_nothing(index_elements=["task_id", "occurrence_date"])
     )
-    await db.commit()
+    await db.flush()
 
 
 async def delete_future_pending(db: AsyncSession, task_id: int, today: date) -> None:
@@ -68,20 +68,7 @@ async def delete_future_pending(db: AsyncSession, task_id: int, today: date) -> 
             Occurrence.occurrence_date >= today,
         )
     )
-    await db.commit()
-
-
-async def mark_missed_before(db: AsyncSession, task_id: int, today: date) -> None:
-    await db.execute(
-        update(Occurrence)
-        .where(
-            Occurrence.task_id == task_id,
-            Occurrence.status == OccurrenceStatus.PENDING,
-            Occurrence.occurrence_date < today,
-        )
-        .values(status=OccurrenceStatus.MISSED)
-    )
-    await db.commit()
+    await db.flush()
 
 
 async def update_status(
@@ -89,6 +76,6 @@ async def update_status(
 ) -> Occurrence:
     occurrence.status = status
     occurrence.completed_at = datetime.now(timezone.utc) if status == OccurrenceStatus.COMPLETED else None
-    await db.commit()
+    await db.flush()
     await db.refresh(occurrence)
     return occurrence

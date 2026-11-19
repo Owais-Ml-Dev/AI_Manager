@@ -1,272 +1,356 @@
 # AI Task Manager — Project Log
 
-Backend-only build (no frontend yet). FastAPI + Supabase (Postgres) + Supabase Auth.
-Built incrementally, step by step. This log tracks what exists, how it works, the
-decisions behind it, and what's deliberately not built yet.
+Backend-only build (Android frontend comes later). FastAPI + Supabase (Postgres +
+Auth) + Upstash Redis + Google Gemini + Firebase Cloud Messaging. Built step by
+step. This log records what exists, how it works, the decisions behind it, test
+results, and what's left.
+
+## Current status (2026-11-19, commit `2e7cb41`)
+
+Backend Phase 1 is complete and verified: 33 endpoints, 9 tables, 16 migrations,
+137 automated tests passing (run with Firebase enabled), live Gemini conversations
+passing, real Firebase project verified. Not yet pushed to GitHub (repository access
+pending). See [Remaining work](#remaining-work).
 
 ## Stack
 
-- **Framework:** FastAPI (async), Python
-- **Database:** Supabase Postgres, via SQLAlchemy 2.0 async + asyncpg
-  - Connects via the **session pooler** (`aws-0-<region>.pooler.supabase.com:5432`), not
-    the direct host — the direct host is IPv6-only and didn't work on this network.
-- **Migrations:** Alembic (async), `alembic/env.py` reads `DATABASE_URL` from `.env`
-- **Auth:** Supabase Auth. Backend never handles passwords — it verifies the ES256 JWT
-  Supabase issues, via its public JWKS endpoint (`app/core/security.py`). No shared
-  secret needed. `jwt.decode(..., leeway=10)` — without the leeway, normal clock jitter
-  between servers causes spurious `ImmatureSignatureError`.
-- **Cache (planned, not yet wired up):** Upstash Redis — reserved for future AI
-  conversation state, never for task data.
-- **AI (not yet built):** Google Gemini — reserved for natural-language intent
-  extraction only. Per the spec: Gemini never executes DB writes, calculates
-  statistics, or runs reminders. All business logic/arithmetic is plain Python.
+- **Framework:** FastAPI (async), Python 3.10
+- **Database:** Supabase Postgres in **Mumbai (`ap-south-1`)**, via SQLAlchemy 2.0
+  async + asyncpg, through the session pooler (`aws-1-ap-south-1.pooler.supabase.com`;
+  the direct host is IPv6-only). ~6 ms per round trip from India.
+- **Migrations:** Alembic (async); 16 migrations, every one verified to upgrade AND
+  roll back cleanly (`manual/check_migrations.py`).
+- **Auth:** Supabase Auth. The backend never handles passwords; it verifies the ES256
+  JWT via Supabase's public JWKS (`app/core/security.py`), `leeway=10` for clock jitter.
+- **Redis:** Upstash (TLS). Scratch space only: assistant conversation state (10-min
+  TTL) and Gemini model-quota memory. Never task data.
+- **AI:** Google Gemini, intent extraction ONLY (text -> validated JSON). Fallback
+  chain `gemini-3.1-flash-lite > gemini-3.5-flash-lite > gemini-3.8-flash`. Gemini
+  never writes data, computes statistics or runs reminders — Python does.
+- **Push:** Firebase Cloud Messaging HTTP v1, service-account auth signed with the
+  existing PyJWT/cryptography (no Google SDK dependency).
+- **Time zones:** per user (IANA names), `tzdata` package for Windows.
 
 ## Architecture
 
-Feature-based layout under `app/features/<name>/`, each with its own
-`models.py`, `schemas.py`, `repository.py`, `service.py`, `router.py`.
-Shared infra lives in `app/core/` (`config.py`, `database.py`, `security.py`).
+Feature-based layout: each feature has `models.py`, `schemas.py`, `repository.py`,
+`service.py`, `router.py`.
 
 ```
 app/
-  core/            config, db engine/session, auth/JWT verification
+  core/            config, database, security (JWT), redis, gemini (+ gemini_quota),
+                   fcm (push), timezones
   common/          shared exceptions (NotFoundError, ValidationError)
   features/
-    tasks/         task CRUD, Eisenhower Matrix view
-    reminders/     reminder config (date range + day selection) + reminder times
-    occurrences/   per-date tracking for recurring tasks
+    tasks/         CRUD, Eisenhower matrix, pause/resume
+    reminders/     schedule (date range + day selection), reminder times,
+                   deliveries, background worker loop
+    occurrences/   per-day tracking for recurring tasks
     history/       append-only event log per task
-    dashboard/     main dashboard, per-task analytics, calendar
+    maintenance/   time-driven changes (overdue, missed, paused days) — worker only
+    dashboard/     dashboard, per-task analytics, calendar
     reports/       monthly productivity report
+    assistant/     Gemini conversation state machine, dispatcher, reply matcher
+    profile/       user settings (time zone)
+    notifications/ in-app inbox, device tokens, reminder delivery + push
+manual/            hand-run tools: REST walkthrough, live Gemini runs, model
+                   benchmark, migration check, Firebase check
 ```
 
-Every feature's own `get_task(db, task_id, user_id)` call (from `tasks.service`) is the
-ownership chokepoint — it 404s (never 403) whether a task doesn't exist or just isn't
-yours, so existence is never leaked.
+**Rules that hold everywhere:**
+- **Ownership:** every task-scoped call goes through `tasks.service.get_task(db, id,
+  user_id)`, which 404s whether a task doesn't exist or isn't yours (existence never
+  leaked).
+- **Reads only read.** GET endpoints never write (a test spies on SQL across all 17
+  read URLs). Time-driven changes are made by the worker.
+- **Atomic writes.** Repositories only flush; each public write commits once, so a
+  change, its history and its reminder/occurrence side effects are saved together or
+  not at all. Exception: the worker's per-delivery claim commits on its own (it's
+  what stops two processes sending the same reminder).
+- **Time:** absolute moments are stored in UTC; calendar concepts (due dates/times,
+  occurrence days, reminder times-of-day, "today") are the owner's local time.
 
 ## Data model (tables)
 
-- **`tasks`** — `id, user_id (FK auth.users.id, cascade), title, description, category
-  (recurring|one_time), urgent, important, status (pending|completed|overdue|cancelled),
-  due_date, due_time, created_at, updated_at`
-- **`reminder_configs`** — one per task (either category): `start_date, end_date
-  (nullable — null means indefinite, recurring tasks only), day_selection_type
-  (every_day|weekdays|weekends|custom_weekdays|custom_dates), custom_weekdays,
-  custom_dates`
-- **`reminder_times`** — many per reminder_config: `time_of_day` (naive, no timezone yet)
-- **`occurrences`** — one row per scheduled date for a recurring task: `occurrence_date,
-  status (pending|completed|missed|skipped), completed_at`. Generated lazily (no
-  background worker yet) whenever occurrences are read for a task — bounded by
-  `end_date`, or a rolling 90-day window if indefinite.
+- **`tasks`** — `user_id` (FK auth.users, cascade), `title, description, category
+  (recurring|one_time), urgent, important, status (pending|completed|overdue|cancelled|
+  paused), due_date, due_time, created_at, updated_at`. DB stores enum names
+  (`'PENDING'`), the API uses values (`"pending"`).
+- **`reminder_configs`** — one per task: `start_date, end_date` (null = indefinite,
+  recurring only), `day_selection_type (every_day|weekdays|weekends|custom_weekdays|
+  custom_dates), custom_weekdays, custom_dates`.
+- **`reminder_times`** — many per config: `time_of_day` (owner's local clock).
+- **`reminder_deliveries`** — one per (time, day): `scheduled_for` (timestamptz, UTC),
+  `status (scheduled|sent|cancelled|failed), sent_at`. Unique (time, scheduled_for).
+- **`occurrences`** — one per scheduled day of a recurring task: `occurrence_date,
+  status (pending|completed|missed|skipped), completed_at`. Unique (task, date).
 - **`task_history_events`** — append-only: `event_type (created|field_updated|
-  priority_changed|status_changed|reopened|schedule_changed), field_name, old_value,
-  new_value, occurred_at`
+  priority_changed|status_changed|reopened|schedule_changed|became_overdue|
+  occurrence_missed|paused|resumed), field_name, old_value, new_value, occurred_at`.
+- **`user_settings`** — `user_id` (PK), `timezone`.
+- **`device_tokens`** — FCM token per installed app: `user_id, token` (unique),
+  `platform, created_at, last_seen_at`.
+- **`notifications`** — inbox: `user_id, task_id` (set null if task deleted),
+  `delivery_id` (unique: one per reminder), `kind, title, body, push_status
+  (sent|no_devices|failed|disabled|pending), created_at, read_at`.
 
-No `recurring_schedules` table — it existed briefly (separate recurrence-type model for
-recurring tasks) but was **removed and merged into `reminder_configs`** once we decided
-recurring and one-time tasks should share the exact same date-range/day-selection/times
-mechanism, differing only in completion behavior (whole-task vs. per-occurrence).
-
-## Endpoints
+## Endpoints (33)
 
 ```
-POST    /tasks                                   create
-GET     /tasks                                   list (own tasks only)
-GET     /tasks/matrix?category=                  Eisenhower Matrix, grouped by quadrant
-GET     /tasks/{id}                               get one
-PATCH   /tasks/{id}                               partial update
+POST    /tasks                                  create
+GET     /tasks                                  list own tasks
+GET     /tasks/matrix?category=                 Eisenhower matrix by quadrant
+GET     /tasks/{id}                             get one
+PATCH   /tasks/{id}                             partial update (can't pause/unpause)
 DELETE  /tasks/{id}
+POST    /tasks/{id}/pause                       pending|overdue -> paused
+POST    /tasks/{id}/resume                      {due_date?, due_time?}; 409
+                                                new_due_date_required if it passed
 
-PUT     /tasks/{id}/reminder-config                set (upsert) date range + day selection
+PUT     /tasks/{id}/reminder-config             set schedule (regenerates everything)
 GET     /tasks/{id}/reminder-config
-POST    /tasks/{id}/reminder-config/reminder-times add a time
+POST    /tasks/{id}/reminder-config/reminder-times
 GET     /tasks/{id}/reminder-config/reminder-times
 PATCH   /tasks/{id}/reminder-config/reminder-times/{time_id}
 DELETE  /tasks/{id}/reminder-config/reminder-times/{time_id}
+GET     /tasks/{id}/reminder-config/deliveries  times shown in the user's zone
 
-GET     /tasks/{id}/occurrences                    list (auto-generates + sweeps missed)
-PATCH   /tasks/{id}/occurrences/{occurrence_id}    mark completed|skipped
+GET     /tasks/{id}/occurrences                 read-only
+PATCH   /tasks/{id}/occurrences/{occ_id}        completed|skipped (pending only)
+GET     /tasks/{id}/history                     times shown in the user's zone
 
-GET     /tasks/{id}/history                        append-only event log
-
-GET     /dashboard                                  totals, completion %, today's occurrences
-GET     /tasks/{id}/analytics                       per-task breakdown (recurring: occurrence
-                                                     counts + monthly performance + calendar
-                                                     history; one-time: status + completed_at)
+GET     /dashboard
+GET     /tasks/{id}/analytics
 GET     /calendar?view=daily|weekly|monthly&anchor_date=
 GET     /reports/monthly?year=&month=
 
-GET     /health                                     DB + Redis connectivity check
+POST    /assistant/message                      {message, input: text|voice}
+
+GET     /me/settings                            {timezone, is_default}
+PUT     /me/settings                            {timezone} — re-plans upcoming reminders
+
+POST    /devices                                {token, platform} register a phone
+GET     /devices                                token shown as last 8 chars only
+DELETE  /devices/{token}                        on logout
+GET     /notifications?unread_only=&limit=      inbox, newest first
+GET     /notifications/unread-count
+POST    /notifications/{id}/read
+POST    /notifications/read-all
+
+GET     /health                                 DB, Redis, Gemini model availability
 ```
 
-All endpoints except `/health` require `Authorization: Bearer <supabase-jwt>`.
+All except `/health` require `Authorization: Bearer <supabase-jwt>`. CORS: only
+origins in `CORS_ORIGINS` (default none; the Android app is unaffected).
 
-## Key policy decisions (the spec deliberately leaves these to the implementer)
+## Key policy decisions
 
-- **Missed-occurrence deadline:** an occurrence becomes `missed` once its date is
-  strictly in the past (server date). No timezone handling yet.
-- **Overdue deadline (one-time tasks):** if only `due_date` is set, overdue starts the
-  day *after* it (the whole due date counts as on-time). If `due_time` is also set,
-  overdue is exact date+time.
-- **"Eligible" for completion-rate denominators** (dashboard, per-task analytics,
-  monthly report — all consistent): excludes skipped occurrences, excludes
-  future-pending occurrences, excludes cancelled one-time tasks.
-- **One-time tasks in a monthly report** are in-scope only if `due_date` falls in that
-  month; tasks with no due date aren't tied to any month and are excluded.
-- **Eisenhower Matrix** in the monthly report is a live snapshot (not filtered to the
-  month) — quadrant membership isn't inherently date-bound.
-- **Task reopening** (completed → not-completed) is logged as its own history event
-  type (`reopened`), distinct from a generic `status_changed`.
-- **No background worker yet**: occurrence generation and overdue detection both happen
-  via "sync on read" (whenever the relevant list/dashboard/report endpoint is hit), not
-  a scheduled job. This is intentional for now — Phase 3 (reminder delivery) is what
-  actually needs a worker.
+- **Overdue (one-time):** date-only -> overdue from local midnight after the due date
+  (the whole day counts as on time); with a due_time -> once that local date+time
+  passes. Judged in the owner's zone; set by the worker within ~30 s.
+- **Missed (recurring):** a pending day becomes missed once that local day has ended.
+- **Paused:** no reminders (future ones removed, the sweep cancels stragglers), never
+  overdue, passing recurring days become *skipped* (not missed), excluded from
+  completion %. Resuming a one-time task whose due date passed asks for a new date.
+- **Completion % "eligible":** excludes skipped days, future days, cancelled and
+  paused one-time tasks. Same rule for dashboard, analytics and monthly report.
+- **Reminders:** generated 90 days ahead (rolling, extended daily); a reminder more than
+  1 hour late (e.g. server was down) is cancelled, not sent; at most 500 per sweep.
+- **Due times float with the user:** "17:00" means 17:00 wherever the user is now, like
+  reminder times. Changing zone re-plans upcoming reminders; sent ones stay.
+- **Daylight saving:** a nonexistent local time fires right after the jump; a repeated
+  one fires on its first occurrence.
+- **Reopening** (completed -> other) is its own history event, `reopened`.
+- **Monthly report:** one-time tasks count in the month of their due date; the matrix
+  is a live snapshot.
 
-## What's built (phases, per the original spec)
+## Background worker (`app/features/reminders/worker.py`)
 
-**Phase 1 — Core backend:** done. Task CRUD, categories, priority/status, due
-date + overdue detection, reminder config + times (shared by both task types),
-recurring occurrence tracking, task history, Supabase Auth + per-user ownership on
-every endpoint.
+Runs inside the API process (FastAPI lifespan). Every 30 s: (1) maintenance —
+overdue, missed, paused days skipped, each with its history event, as single SQL
+statements judged in each owner's zone; (2) reminder sweep — claim each due delivery
+atomically, then deliver (inbox + push) or cancel (task done/paused/cancelled, day
+completed/skipped, or stale). Once per UTC day: extend every schedule's 90-day horizon.
+Safe with several server processes.
 
-**Phase 2 — Priority & analytics:** done. Eisenhower Matrix, main dashboard,
-per-task analytics, calendar (daily/weekly/monthly), monthly productivity report.
+## AI assistant (`app/features/assistant/`)
 
-**Phase 3 — Reminder system:** data model only (`reminder_configs`/`reminder_times`
-exist). Not built: background worker to actually fire reminders, notification
-delivery, Upstash Redis connection (`.env` still has placeholder values).
+Text in -> Gemini returns intent JSON -> Pydantic validates against an allowlist ->
+Python asks for missing details -> Python asks to confirm -> only on "yes" does the
+dispatcher call the SAME services the API uses. Intents: create (one-time or
+recurring with schedule), update, delete, complete, change priority, list, stats,
+set reminders on an existing task, pause, resume. Yes/no/choice replies (incl. spoken
+and Hinglish: "yeah do it", "haan", "nahi", "the second one", "dusra") are matched by
+Python without calling Gemini; a reply only confirms if every word is a yes/filler
+word ("yes but call it X" is a changed request). Conversation state in Redis.
 
-**Phase 4 — Voice AI:** not started. Needs: Gemini API key, Redis-backed conversation
-state machine, intent-extraction → structured JSON → Pydantic validation → confirmation
-flow, before any AI-initiated write is allowed to execute.
+## Notifications (`app/features/notifications/`, `app/core/fcm.py`)
 
-**Phase 5 — Frontend:** out of scope per the original request (backend only).
+Each reminder the worker claims -> an inbox entry (always, once per delivery) -> push to
+every registered device via FCM. Android: priority HIGH, channel `task_reminders`,
+1-hour TTL. Dead tokens removed. Push outcome stored on the entry. Without
+`FIREBASE_CREDENTIALS_FILE`, push is off and the inbox still works.
 
-**Phase 6 — Testing:** manual curl-script regression testing only, run after every
-feature addition (tasks CRUD, reminders, occurrences, overdue, history, auth isolation,
-matrix, dashboard, analytics, calendar, reports — all independently verified against
-real Supabase data with two separate signed-up users to confirm isolation). No
-automated `pytest` suite yet, despite `pytest`/`pytest-asyncio` being in
-`requirements.txt` since the initial scaffold.
+## Testing
 
-## Bugs found and fixed along the way
+- **Automated (pytest): 137 tests**, real Supabase DB + Redis with two dedicated test
+  accounts; only Gemini and Google's FCM network are faked. Files: unit logic 34,
+  assistant 28, reminders 14, tasks 13, notifications 12, state & history 10, time
+  zones 10, Gemini fallback 7, analytics 5, CORS 4. ~75 s.
+- **Mutation checks:** for each core guarantee added in Steps 1–5, the protecting test
+  was shown to FAIL when the code was deliberately broken, then restored.
+- **Manual tools (`manual/`):** `manual_tests.http` (VS Code REST Client walkthrough),
+  `gemini_e2e.py` (live Gemini conversations, sets: main 31 steps, `--reworded` 19,
+  `--step4` 15, `--force-fallback`), `gemini_model_bench.py`, `check_migrations.py`
+  (temporary DB, upgrade -> downgrade -> upgrade, compares schema incl. enum values),
+  `check_fcm.py` (validates the real Firebase setup without delivering anything).
 
-- Two separate `delete`/`update` naming collisions where a repository module's own
-  function name shadowed the same-named SQLAlchemy import, causing infinite
-  self-recursion instead of executing SQL (`tasks/repository.py`, same pattern caught
-  twice).
-- `get_reminder_config`, `get_schedule` (now removed), and `update_occurrence` initially
-  had no ownership check at all — any authenticated user could read/modify another
-  user's reminder config, schedule, or occurrences by guessing a task ID. Fixed by
-  routing every one through the ownership-checking `get_task`.
-- JWT verification used PyJWT's default `leeway=0`, causing intermittent
-  `ImmatureSignatureError` from ~tens of milliseconds of ordinary clock drift between
-  this server and Supabase's. Fixed with `leeway=10`.
-- Postgres enum types created via `op.add_column` (not `op.create_table`) need an
-  explicit `sa.Enum(...).create(op.get_bind())` in the migration — Alembic's
-  autogenerate doesn't add that automatically outside of table creation. Hit this twice
-  (`task_category`, `task_status`, `occurrence_status`) before it became routine.
-- Monthly report's per-task completion percentage initially used `scheduled − skipped`
-  as the denominator (wrongly including future not-yet-elapsed days), inconsistent with
-  the matching overall-recurring-performance formula. Fixed to track per-task
-  eligibility (date ≤ today, not skipped) the same way as the aggregate.
+---
 
-## Live testing, assistant hardening, region move, model choice (2026-11-18/19)
+## History
 
-**Test tooling** (`backend/manual/`): `manual_tests.http` (VS Code REST Client
-walkthrough of every endpoint; login read from `manual/.env`, gitignored),
-`gemini_e2e.py` (automated sign-up/login + full assistant conversation against the REAL
-Gemini, DB-checked after every message, per-call latency/tokens/model version, report
-to `manual/reports/`, gitignored; `--reworded` runs phrasings that appear nowhere in the
-prompt), `gemini_model_bench.py` (same 16 messages to several models, speed + graded
-accuracy). Pytest suite: 72 tests.
+### Initial build (2026-11-17)
+
+Phase 1 core (task CRUD, categories, priority/status, due date + overdue, reminder
+config + times shared by both task types, recurring occurrences, history, Supabase Auth
++ ownership), Phase 2 analytics (matrix, dashboard, per-task analytics, calendar,
+monthly report), reminder worker, Redis + Gemini assistant, then pytest (68 tests) and
+worker hardening. Recurring tasks briefly had their own `recurring_schedules` table;
+it was merged into `reminder_configs` once both task types shared one schedule model,
+differing only in completion (whole task vs per day).
+
+### Bugs found and fixed along the way
+
+- Repository functions named `delete`/`update` shadowed the SQLAlchemy imports,
+  causing infinite self-recursion (caught twice in `tasks/repository.py`).
+- `get_reminder_config`, `get_schedule` (removed) and `update_occurrence` initially had
+  no ownership check — any user could read/modify another's by guessing an id. All now
+  go through `get_task`.
+- JWT `leeway=0` caused intermittent `ImmatureSignatureError` from clock drift -> 10 s.
+- Enum types added via `op.add_column` need an explicit `.create()` in the migration.
+- Monthly report per-task % used a denominator including future days -> per-task
+  eligibility.
+
+### Live testing, assistant hardening, region move, model choice (2026-11-18/19)
 
 **Assistant bugs found by the live runs, fixed with regression tests:**
-- Task selection trapped the user: anything but a number re-asked "which one?" forever
-  (even "no") until the 10-min state expired. Now "no" cancels, an out-of-range number
-  re-asks, anything else is treated as a new request.
-- Gemini read "make X urgent" as `create_task` -> confirming created a duplicate. Prompt
-  now spells out create vs change_priority/update/complete/delete; Python also warns
-  before confirming a create whose exact title already exists.
-- Task lookup was substring-only: "feeding the cat" didn't find "Feed the cat",
-  "passport wala task" found nothing. Now deterministic: substring first, then
-  all-key-words match after removing filler words and simple stemming. Never guesses —
-  several matches still ask the user to pick. (A vector DB was considered and rejected:
-  overkill for matching within one user's own task list, adds an AI call and
-  nondeterminism.)
-- A prompt example matched a test message word for word ("call it Water the plants"),
-  inflating that test. Replaced with a neutral example; the `--reworded` set guards
-  against this.
-- Gemini down/slow now replies "The assistant is busy... try again" and keeps the
-  in-progress request (was "didn't understand", which blamed the user's wording).
-  `GeminiUnavailableError` (timeout/network/429/5xx) vs `GeminiError` (unusable answer).
-- "no"/"cancel" with nothing pending is answered by rule ("Nothing to cancel."), no
-  Gemini call; it also cancels a half-collected request.
+- Task selection trapped the user ("which one?" forever). Now "no" cancels, an
+  out-of-range number re-asks, anything else is a new request.
+- Gemini read "make X urgent" as create -> duplicate. Prompt clarified; Python warns
+  before creating a task whose exact title exists.
+- Task lookup was substring-only. Now: substring, then all key words after removing
+  filler and stemming (a vector DB was considered and rejected: overkill for one user's
+  task list, adds an AI call and nondeterminism).
+- A prompt example matched a test message word for word; replaced, and the
+  `--reworded` set guards against it.
+- Gemini down/slow -> "The assistant is busy... try again", request kept.
+- "no"/"cancel" with nothing pending is answered by rule.
 
-**Latency.** Measured, not assumed: the DB was in Tokyo (~300 ms per round trip from
-India) and requests make several sequential round trips (connection pre-ping + BEGIN,
-prepare + execute per new statement, COMMIT) -> list tasks 3.4s, assistant "yes" 6.5s,
-dashboard 9.6s. Moved to a new Supabase project in **Mumbai (ap-south-1)**, same
-migrations: round trip 6 ms; list tasks 0.07s, "yes" 0.19s, dashboard 0.23s; pytest
-~15 min -> 33s. Gemini is now ~95% of assistant response time.
+**Latency.** The DB was in Tokyo (~300 ms per round trip; requests make several) ->
+list 3.4 s, "yes" 6.5 s, dashboard 9.6 s. Moved to Mumbai: 6 ms; list 0.07 s, "yes"
+0.19 s, dashboard 0.23 s; pytest ~15 min -> ~33 s.
 
-**Gemini model.** Benchmarked on the real prompt (2026-11-19): `gemini-3.1-flash-lite`
-31/32 correct, median 1.2s; `gemini-3.5-flash-lite` (what `-latest` resolved to) 30/32,
-median 4.5s. `gemini-2.5-flash` / `-lite` are retired for new users; `gemini-3.8-flash`
-allows only 20 requests/day on the free tier (unusable without a paid plan). Now pinned
-to `gemini-3.1-flash-lite` as the primary of a fallback chain (see below). Requests use
-`responseMimeType: application/json`; all answer parts are joined; unparseable answers
-log `finishReason` + model version (a rare cut-off answer was seen once, cause not yet
-confirmed). Timeout 8s per attempt + 1 retry: 4s was tried and cut off real 4-8s
-answers; 8s gave 0 user-visible failures in 33 calls. Free tier also rate-limits per
-minute (429), which the fast backend can now hit.
+**Gemini model.** Benchmarked on the real prompt: `gemini-3.1-flash-lite` 31/32,
+median 1.2 s; `gemini-3.5-flash-lite` 30/32, 4.5 s. `gemini-2.5-flash(-lite)` retired
+for new users; `gemini-3.8-flash` 20 requests/day free. JSON response mode; all answer
+parts joined; timeout 8 s + 1 retry (4 s cut off real answers).
 
-**Tried and removed: hedged requests.** After 3s with no answer, send a duplicate and
-use whichever answers first. Live result: fired on 13 of 18 messages, the duplicate won
-only 2 times (when Gemini is slow both copies usually are; real stalls hit both), and
-the extra calls (32 vs ~18) exhausted the free per-minute quota, causing 429s. Net
-negative on the free tier; never committed.
+**Tried and removed: hedged requests** — the duplicate won 2 of 13 times and the extra
+calls hit the free per-minute quota. Never committed.
 
-**Broken answers are retried.** New logging caught the rare bad answer: Gemini itself
-sends JSON cut off mid-object while reporting `finishReason=STOP`, even in JSON mode.
-An unusable answer now gets the same single retry as a 503; seen live, the retry
-answered correctly.
+**Broken answers retried:** Gemini occasionally sends JSON cut off mid-object with
+`finishReason=STOP`; an unusable answer gets one retry.
 
-**Model fallback with quota memory** (`app/core/gemini_quota.py`). Chain in priority
-order, `GEMINI_MODELS` (default `gemini-3.1-flash-lite,gemini-3.5-flash-lite,
-gemini-3.8-flash`). Each model has its own free quota.
-- A 429 (quota) or 404 (retired) marks that model in Redis
-  (`gemini:exhausted:<model>`) and the same request immediately tries the next model,
-  with no delay and no retry of the refused one.
-- Later requests skip marked models without calling them.
-- The key's expiry is Google's own reset time (`RetryInfo.retryDelay`, e.g. "535s"),
-  so the model comes back first in line automatically. Daily quotas reset at midnight
-  US Pacific (13:30 IST).
-- Per-minute vs per-day limits are read from the `quotaId`. If Google gives no delay:
-  60s for per-minute or unreadable bodies, 1h for daily (no `tzdata` dependency
-  needed), 24h for retired models.
-- Timeouts and 503s are NOT quota: one retry on the same model, never a switch, so a
-  slow moment can't push everyone onto the slower backups.
-- Redis in the middle of this fails open (just tries the primary).
-- All models out of quota: the reply says "available again in about N minutes".
-- `/health` shows each model's state.
+**Model fallback with quota memory** (`app/core/gemini_quota.py`): a 429/404 marks the
+model in Redis (`gemini:exhausted:<model>`) with Google's `retryDelay` as expiry; the
+same request moves to the next model; later requests skip it; it returns automatically.
+Timeouts/503s never switch models. Fails open if Redis is down. Verified live (a real
+per-minute 429 switched 3.1 -> 3.5 and back after 57 s). Accepted trade-offs: 3.5 is
+~4x slower; 3.8 Flash scored 0/16 right after its reset and is kept as last resort by
+choice (~17 s wait then "busy" if both lite models are exhausted).
 
-Verified: 8 pytest tests (fake Gemini, real Redis; includes the 4-request
-exhausted-model-skipping scenario); live, a real per-minute 429 on 3.1 switched to 3.5
-in the same request and returned to 3.1 after 57s; `gemini_e2e.py --force-fallback`
-(primary marked exhausted) ran 19/19 on 3.5 with 0 calls to 3.1.
+### Steps 1–5 (2026-11-19)
 
-Known trade-offs, accepted:
-- 3.5 Flash Lite is ~4x slower (median 6s in the forced run).
-- `gemini-3.8-flash` scored 0/16 in a benchmark right after its daily reset (12
-  timeouts at 30s, 4 503s). It is kept as last resort by choice, so when both lite
-  models are exhausted a message may wait ~17s and then get "busy". To drop it:
-  `GEMINI_MODELS=gemini-3.1-flash-lite,gemini-3.5-flash-lite`.
+**Step 1 — `0473211`: migration rollbacks, status default, CORS.**
+- 7 migrations could not be rolled back: `3b75c057dcec` created its foreign key
+  unnamed (`drop_constraint(None)`), now named `tasks_user_id_fkey` (the name Postgres
+  already used, so existing DBs unchanged); `25fdf7de77ad` created an enum twice on
+  rollback; `64070b3e391e`, `5eb63c795857`, `f03b02de7da9`, `1125e38689c2`,
+  `bda9ebf29c28` left their enum types behind. Proven with `check_migrations.py`.
+- Task status `server_default` used the value (`pending`) instead of the stored name
+  (`PENDING`), unlike the other status columns.
+- CORS was `*`; now `CORS_ORIGINS` only, no credentials, only the methods/headers used.
+- Tests: 89 passed.
+
+**Step 2 — `80abd79`: per-user time zones.** `user_settings` + `GET/PUT /me/settings`
+(default `Asia/Kolkata`; names validated against Python and Postgres). All 18
+server-clock uses replaced; overdue detection is one SQL statement using each owner's
+zone; `reminder_deliveries.scheduled_for` became timestamptz (migration `524dcf696aa4`);
+changing zone re-plans reminders; daylight-saving rules as above. Tests use UTC+14 and
+UTC-11 zones so dates always differ. Tests: 99 passed; live Gemini 30/30.
+
+**Step 3 — `5b008ac`: reads stop writing; pause/resume; atomic history.** The 12
+GET-time writes moved to the worker's maintenance step; automatic `became_overdue` and
+`occurrence_missed` events (one SQL statement each, recorded once even with two
+workers); pause/resume endpoints with `paused`/`resumed` events and the
+new-due-date rule; repositories flush, services commit once (migration
+`4187cbe11e04`). Tests: 109 passed (incl. zero SQL writes across 17 GET URLs);
+live Gemini 30/30.
+
+**Step 4 — `bab76b7`: assistant features.** Recurring tasks with schedules, reminders
+on existing tasks, pause/resume, one-time due times, offer-to-create for reminders on
+unknown tasks, `input: voice|text`, rule-based spoken/Hinglish replies. Atomicity fix
+before commit: `reminders_service.replace_schedule` saves schedule + times + deliveries
++ occurrences + history in one transaction; a new recurring task and its schedule are
+one transaction; failed confirmed actions roll back (regression tests fail mid-save).
+Live runs found and fixed: Gemini returns `null` for empty lists; "meditation" didn't
+find "meditate" (5-letter shared-prefix match); "remind me to X" read as an existing-task
+reminder; "do it" read as option 2. Tests: 125 passed; live Gemini step4 15/15, main
+31/31, reworded 19/19.
+
+**Step 5 — `2e7cb41`: notifications.** Inbox, device registration, FCM push from the
+worker (migration `2c6bac4cc341`); replaces the log-only stub. Firebase project
+`ai-task-manager-cf064` created; key stored in `backend/secrets/` (gitignored);
+`check_fcm.py` confirmed Google accepts the key, project and message format. Tests:
+137 passed with Firebase enabled. Every commit searched for the real secret values
+(DB password, Gemini key, Redis token, test passwords, Firebase key): none present.
+
+## Remaining work
+
+**Needs you:**
+- GitHub push: access for `fidarimex-owais` to `Owais-Ml-Dev/AI_Manager` (or push as
+  that account). Nothing has been pushed yet: all 12 commits exist only locally.
+- Reset the Mumbai database password (it was shared in chat), then update `.env`.
+- Pause/delete the old Tokyo Supabase project; then remove its commented-out lines
+  from `.env`.
+
+**Android phase (planned, not started):** get the FCM token and `POST /devices` (and
+`DELETE` on logout); request the notification permission (Android 13+); create the
+`task_reminders` channel; real on-phone delivery test (`check_fcm.py --token <t>
+--send`); speech-to-text with Android's recognizer, sending `input: "voice"`; send the
+device zone to `PUT /me/settings` at login; add any web origin to `CORS_ORIGINS`.
+
+**Known gaps / limitations:**
+- Completing or skipping a recurring *day* is not recorded in task history (overdue,
+  missed, paused/resumed and task status changes are).
+- Failed pushes are not retried (the inbox entry always exists).
+- Overdue/missed appear up to ~30 s after the moment (worker interval).
+- The worker runs inside the API process; a deployment must keep at least one API
+  process running.
+- The assistant can't set `custom_dates` schedules (the API can).
+- Gemini free tier: per-minute and daily limits; `gemini-3.8-flash` unreliable as
+  last resort; a paid tier would give steadier speed.
+- No deployment yet (host near Mumbai to keep latency low).
 
 ## Environment / secrets
 
-`backend/.env` (gitignored, never committed) holds: `DATABASE_URL` (Supabase pooler
-connection string), `SUPABASE_URL` (not secret, used for JWKS), `REDIS_URL` (Upstash,
-TLS), `GEMINI_API_KEY`, optional `GEMINI_MODELS` (fallback chain, comma-separated). `backend/.env.test` holds the pytest accounts
-and publishable key; `backend/manual/.env` the manual-testing login.
-`backend/.env.example` is the template, kept free of real values.
+All gitignored, never committed (verified):
+- `backend/.env`: `DATABASE_URL`, `SUPABASE_URL` (not secret), `REDIS_URL`,
+  `GEMINI_API_KEY`, optional `GEMINI_MODELS`, `DEFAULT_TIMEZONE`, `CORS_ORIGINS`,
+  `FIREBASE_CREDENTIALS_FILE=secrets/firebase-service-account.json`.
+- `backend/secrets/firebase-service-account.json`: Firebase private key.
+- `backend/.env.test`: pytest accounts + Supabase publishable key.
+- `backend/manual/.env`: manual-testing login.
+
+`backend/.env.example` and `backend/manual/.env.example` are templates without real
+values.

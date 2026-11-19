@@ -381,6 +381,38 @@ Content-Type: application/json
 
 
 ###############################################################################
+# 6b. NOTIFICATIONS — every reminder lands in the inbox; push needs Firebase
+###############################################################################
+
+### Register a phone (the Android app will send its real FCM token)
+POST {{baseUrl}}/devices
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "token": "test-device-token-0123456789abcdefghij", "platform": "android" }
+
+### Your devices (token shown as its last 8 characters only)
+GET {{baseUrl}}/devices
+Authorization: Bearer {{token}}
+
+### Inbox (newest first). Add ?unread_only=true to filter.
+GET {{baseUrl}}/notifications
+Authorization: Bearer {{token}}
+
+### Unread count (for the app's badge)
+GET {{baseUrl}}/notifications/unread-count
+Authorization: Bearer {{token}}
+
+### Mark everything read
+POST {{baseUrl}}/notifications/read-all
+Authorization: Bearer {{token}}
+
+### Unregister the phone (on logout)
+DELETE {{baseUrl}}/devices/test-device-token-0123456789abcdefghij
+Authorization: Bearer {{token}}
+
+
+###############################################################################
 # 7. CLEANUP — run LAST: deletes the tasks the saved IDs point to
 #    (their reminders, occurrences and history are deleted with them)
 ###############################################################################

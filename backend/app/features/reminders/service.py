@@ -13,7 +13,6 @@ from datetime import date, datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.exceptions import NotFoundError, ValidationError
-from app.core.notifications import send_reminder_notification
 from app.core.timezones import local_to_utc, now_utc, task_owner_zone, today_in
 from app.features.history import service as history_service
 from app.features.reminders import repository
@@ -329,9 +328,13 @@ async def run_reminder_sweep(db: AsyncSession) -> int:
             continue
         processed += 1
         try:
-            send_reminder_notification(task.id, task.title, delivery.scheduled_for)
+            # In-app inbox entry + push to the user's phones (FCM).
+            from app.features.notifications.service import deliver_reminder
+
+            await deliver_reminder(db, task, delivery)
         except Exception:  # a failed channel must not stop the rest of the sweep
             logger.exception("Sending reminder delivery %s failed", delivery.id)
+            await db.rollback()
             await repository.mark_delivery_failed(db, delivery.id)
 
     return processed

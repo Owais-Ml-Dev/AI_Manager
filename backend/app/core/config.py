@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     def gemini_model_chain(self) -> list[str]:
         return [m.strip() for m in self.gemini_models.split(",") if m.strip()]
 
+    # Path to the Firebase service-account JSON (a private key; keep it in
+    # backend/secrets/, which is gitignored). Empty = push notifications off;
+    # reminders still go to the in-app inbox.
+    firebase_credentials_file: str = ""
+
     # Time zone for users who haven't set one yet (IANA name). The app sends
     # the device's zone at login via PUT /me/settings.
     default_timezone: str = "Asia/Kolkata"

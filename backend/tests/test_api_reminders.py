@@ -227,9 +227,13 @@ async def test_stale_delivery_is_cancelled_not_sent(client, auth_a, make_task, d
 async def test_concurrent_sweeps_send_each_reminder_once(client, auth_a, make_task, db, monkeypatch):
     task, _ = await _due_delivery(client, auth_a, make_task, db, "send me once", 1)
     sent = []
-    monkeypatch.setattr(
-        reminders_service, "send_reminder_notification", lambda task_id, *_: sent.append(task_id)
-    )
+    from app.features.notifications import service as notifications_service
+
+    async def record(db, task, delivery):
+        sent.append(task.id)
+        return "sent"
+
+    monkeypatch.setattr(notifications_service, "deliver_reminder", record)
 
     async def sweep():
         async with AsyncSessionLocal() as session:

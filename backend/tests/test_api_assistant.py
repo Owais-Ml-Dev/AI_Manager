@@ -6,7 +6,9 @@ plain rules without any Gemini call. Includes regressions for bug 5.
 """
 import pytest
 
-from app.core.gemini import GeminiError, GeminiUnavailableError
+from datetime import datetime, timedelta, timezone
+
+from app.core.gemini import GeminiError, GeminiQuotaExhaustedError, GeminiUnavailableError
 from app.features.assistant import service as assistant_service
 
 pytestmark = pytest.mark.usefixtures("clean_accounts")
@@ -200,3 +202,10 @@ async def test_cancel_handled_by_rules_without_gemini(gemini, say):
     gemini.append({"intent": "create_task", "title": None, "missing_fields": ["title"]})
     await say("Create a task")
     assert (await say("never mind")) == {"reply": "Cancelled.", "state": "idle"}
+
+
+async def test_all_models_out_of_quota_says_when_it_comes_back(gemini, say):
+    gemini.append(GeminiQuotaExhaustedError(datetime.now(timezone.utc) + timedelta(minutes=40)))
+    reply = await say("Show my tasks")
+    assert "usage limit" in reply["reply"] and "40 minutes" in reply["reply"]
+    assert reply["state"] == "idle"

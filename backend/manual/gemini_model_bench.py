@@ -44,6 +44,13 @@ MODELS = {
     "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
 }
 REPEATS = 2
+# Optional: --models gemini-3.8-flash[,more] --repeats 1  (e.g. to stay inside
+# a model's tiny daily free quota: gemini-3.8-flash allows 20 requests/day).
+if "--models" in sys.argv:
+    _wanted = sys.argv[sys.argv.index("--models") + 1].split(",")
+    MODELS = {name: mid for name, mid in MODELS.items() if mid in _wanted} or {m: m for m in _wanted}
+if "--repeats" in sys.argv:
+    REPEATS = int(sys.argv[sys.argv.index("--repeats") + 1])
 CALLS_PER_MINUTE = 8          # per model; free tier rejects bursts with 429
 TIMEOUT_SECONDS = 30.0        # generous, to measure true latency
 APP_TIMEOUT_SECONDS = 8.0     # what the app actually allows per attempt

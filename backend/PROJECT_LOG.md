@@ -214,17 +214,59 @@ migrations: round trip 6 ms; list tasks 0.07s, "yes" 0.19s, dashboard 0.23s; pyt
 31/32 correct, median 1.2s; `gemini-3.5-flash-lite` (what `-latest` resolved to) 30/32,
 median 4.5s. `gemini-2.5-flash` / `-lite` are retired for new users; `gemini-3.8-flash`
 allows only 20 requests/day on the free tier (unusable without a paid plan). Now pinned
-to `gemini-3.1-flash-lite` (override with `GEMINI_MODEL`). Requests use
+to `gemini-3.1-flash-lite` as the primary of a fallback chain (see below). Requests use
 `responseMimeType: application/json`; all answer parts are joined; unparseable answers
 log `finishReason` + model version (a rare cut-off answer was seen once, cause not yet
 confirmed). Timeout 8s per attempt + 1 retry: 4s was tried and cut off real 4-8s
 answers; 8s gave 0 user-visible failures in 33 calls. Free tier also rate-limits per
 minute (429), which the fast backend can now hit.
 
+**Tried and removed: hedged requests.** After 3s with no answer, send a duplicate and
+use whichever answers first. Live result: fired on 13 of 18 messages, the duplicate won
+only 2 times (when Gemini is slow both copies usually are; real stalls hit both), and
+the extra calls (32 vs ~18) exhausted the free per-minute quota, causing 429s. Net
+negative on the free tier; never committed.
+
+**Broken answers are retried.** New logging caught the rare bad answer: Gemini itself
+sends JSON cut off mid-object while reporting `finishReason=STOP`, even in JSON mode.
+An unusable answer now gets the same single retry as a 503; seen live, the retry
+answered correctly.
+
+**Model fallback with quota memory** (`app/core/gemini_quota.py`). Chain in priority
+order, `GEMINI_MODELS` (default `gemini-3.1-flash-lite,gemini-3.5-flash-lite,
+gemini-3.8-flash`). Each model has its own free quota.
+- A 429 (quota) or 404 (retired) marks that model in Redis
+  (`gemini:exhausted:<model>`) and the same request immediately tries the next model,
+  with no delay and no retry of the refused one.
+- Later requests skip marked models without calling them.
+- The key's expiry is Google's own reset time (`RetryInfo.retryDelay`, e.g. "535s"),
+  so the model comes back first in line automatically. Daily quotas reset at midnight
+  US Pacific (13:30 IST).
+- Per-minute vs per-day limits are read from the `quotaId`. If Google gives no delay:
+  60s for per-minute or unreadable bodies, 1h for daily (no `tzdata` dependency
+  needed), 24h for retired models.
+- Timeouts and 503s are NOT quota: one retry on the same model, never a switch, so a
+  slow moment can't push everyone onto the slower backups.
+- Redis in the middle of this fails open (just tries the primary).
+- All models out of quota: the reply says "available again in about N minutes".
+- `/health` shows each model's state.
+
+Verified: 8 pytest tests (fake Gemini, real Redis; includes the 4-request
+exhausted-model-skipping scenario); live, a real per-minute 429 on 3.1 switched to 3.5
+in the same request and returned to 3.1 after 57s; `gemini_e2e.py --force-fallback`
+(primary marked exhausted) ran 19/19 on 3.5 with 0 calls to 3.1.
+
+Known trade-offs, accepted:
+- 3.5 Flash Lite is ~4x slower (median 6s in the forced run).
+- `gemini-3.8-flash` scored 0/16 in a benchmark right after its daily reset (12
+  timeouts at 30s, 4 503s). It is kept as last resort by choice, so when both lite
+  models are exhausted a message may wait ~17s and then get "busy". To drop it:
+  `GEMINI_MODELS=gemini-3.1-flash-lite,gemini-3.5-flash-lite`.
+
 ## Environment / secrets
 
 `backend/.env` (gitignored, never committed) holds: `DATABASE_URL` (Supabase pooler
 connection string), `SUPABASE_URL` (not secret, used for JWKS), `REDIS_URL` (Upstash,
-TLS), `GEMINI_API_KEY`, optional `GEMINI_MODEL`. `backend/.env.test` holds the pytest accounts
+TLS), `GEMINI_API_KEY`, optional `GEMINI_MODELS` (fallback chain, comma-separated). `backend/.env.test` holds the pytest accounts
 and publishable key; `backend/manual/.env` the manual-testing login.
 `backend/.env.example` is the template, kept free of real values.

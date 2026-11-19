@@ -17,7 +17,12 @@ import uuid
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.gemini import GeminiError, GeminiUnavailableError, generate_json
+from app.core.gemini import (
+    GeminiError,
+    GeminiQuotaExhaustedError,
+    GeminiUnavailableError,
+    generate_json,
+)
 from app.features.assistant import conversation_state, dispatcher
 from app.features.assistant.schemas import (
     LOOKUP_INTENTS,
@@ -56,6 +61,19 @@ _REQUIRED_FIELDS = {
     Intent.DELETE_TASK: ["title"],
     Intent.COMPLETE_TASK: ["title"],
 }
+
+
+def _wait_phrase(available_at) -> str:
+    """'in about 40 minutes' — relative, because the app has no per-user
+    timezone yet (a clock time would be in the server's zone)."""
+    from datetime import datetime, timezone
+
+    seconds = max(0, (available_at - datetime.now(timezone.utc)).total_seconds())
+    if seconds < 90:
+        return "in about a minute"
+    if seconds < 90 * 60:
+        return f"in about {round(seconds / 60)} minutes"
+    return f"in about {round(seconds / 3600)} hours"
 
 
 def _missing_required(intent: Intent, pending: PendingAction) -> list[str]:
@@ -276,6 +294,15 @@ async def handle_message(db: AsyncSession, user_id: uuid.UUID, message: str) -> 
     try:
         raw = await generate_json(prompt)
         parsed = GeminiIntentOutput.model_validate(raw)
+    except GeminiQuotaExhaustedError as exc:
+        # Every model in the fallback chain is out of free quota. Say when it
+        # comes back; keep any in-progress request for then.
+        logger.warning("All Gemini models out of quota: %s", exc)
+        return AssistantMessageResponse(
+            reply=f"The assistant has reached its usage limit for now. "
+                  f"It will be available again {_wait_phrase(exc.available_at)}.",
+            state=pending.state,
+        )
     except GeminiUnavailableError as exc:
         # Gemini down/slow: not the user's wording, so don't ask them to
         # rephrase. Any in-progress request is kept for their retry.

@@ -58,6 +58,7 @@ KEEP = "--keep" in sys.argv
 class GeminiAttempt:
     seconds: float
     status: int | str
+    model: str = ""
     model_version: str | None = None
     prompt_tokens: int | None = None
     output_tokens: int | None = None
@@ -70,16 +71,17 @@ _real_post_once = gemini._post_once
 _real_generate_json = assistant_service.generate_json
 
 
-async def _timed_post_once(prompt: str) -> httpx.Response:
+async def _timed_post_once(prompt: str, model: str, timeout: float = gemini._TIMEOUT_SECONDS) -> httpx.Response:
     await _respect_rate_limit()
     _call_times.append(time.monotonic())
     start = time.perf_counter()
     try:
-        response = await _real_post_once(prompt)
-    except Exception as exc:
-        _attempts.append(GeminiAttempt(time.perf_counter() - start, type(exc).__name__))
+        response = await _real_post_once(prompt, model, timeout=timeout)
+    except BaseException as exc:  # incl. CancelledError
+        status = "cancelled" if isinstance(exc, asyncio.CancelledError) else type(exc).__name__
+        _attempts.append(GeminiAttempt(time.perf_counter() - start, status, model))
         raise
-    attempt = GeminiAttempt(time.perf_counter() - start, response.status_code)
+    attempt = GeminiAttempt(time.perf_counter() - start, response.status_code, model)
     if response.status_code == 200:
         body = response.json()
         usage = body.get("usageMetadata", {})
@@ -91,15 +93,22 @@ async def _timed_post_once(prompt: str) -> httpx.Response:
     return response
 
 
+_gen_seconds: list[float] = []  # wall time per generate_json call (hedged calls overlap)
+
+
 async def _recording_generate_json(prompt: str) -> dict:
-    result = await _real_generate_json(prompt)
+    start = time.perf_counter()
+    try:
+        result = await _real_generate_json(prompt)
+    finally:
+        _gen_seconds.append(time.perf_counter() - start)
     _parsed_outputs.append(result)
     return result
 
 
 class _WarningCollector(logging.Handler):
     def __init__(self):
-        super().__init__(logging.WARNING)
+        super().__init__(logging.INFO)  # INFO too: hedge decisions
         self.messages: list[str] = []
 
     def emit(self, record):
@@ -109,6 +118,7 @@ class _WarningCollector(logging.Handler):
 _warnings = _WarningCollector()
 for _name in ("gemini", "assistant"):
     logging.getLogger(_name).addHandler(_warnings)
+logging.getLogger("gemini").setLevel(logging.INFO)
 
 # Free-tier Gemini allows a limited number of requests per minute (HTTP 429
 # beyond that). Keep this run under it so the test measures the app, not quota.
@@ -153,10 +163,11 @@ class Result:
     detail: str
     tasks_after: int = 0
     warnings: list = field(default_factory=list)
+    gemini_wall: float | None = None  # time until Gemini's answer (hedged calls overlap)
 
     @property
     def gemini_seconds(self) -> float:
-        return sum(a.seconds for a in self.attempts)
+        return self.gemini_wall if self.gemini_wall is not None else sum(a.seconds for a in self.attempts)
 
 
 def by_title(tasks: list[dict]) -> dict[str, dict]:
@@ -256,6 +267,9 @@ def build_reworded_steps() -> list[Step]:
 
 
 REWORDED = "--reworded" in sys.argv
+# Marks the primary model "out of quota" in Redis for this run, to watch every
+# request go straight to the first backup (and the primary never be called).
+FORCE_FALLBACK = "--force-fallback" in sys.argv
 
 
 TOMORROW = (date.today() + timedelta(days=1)).isoformat()
@@ -384,6 +398,11 @@ async def run() -> None:
     user_id = jwt.decode(token, options={"verify_signature": False})["sub"]
     import uuid
     await conversation_state.clear_pending(uuid.UUID(user_id))
+    if FORCE_FALLBACK:
+        from app.core.gemini_quota import QuotaHit, mark_unavailable
+        await mark_unavailable(settings.gemini_model_chain[0],
+                               QuotaHit("test", 900, "forced by gemini_e2e --force-fallback"))
+        print(f"   (--force-fallback: {settings.gemini_model_chain[0]} marked exhausted for this run)")
 
     results: list[Result] = []
     steps = build_reworded_steps() if REWORDED else build_steps()
@@ -395,7 +414,7 @@ async def run() -> None:
                     "title": title, "category": "one_time", "urgent": False, "important": False})
             print("   (setup: created 'Meeting with client' + 'Meeting with design team' via the API)")
 
-        before_attempts, before_parsed = len(_attempts), len(_parsed_outputs)
+        before_attempts, before_parsed, before_gen = len(_attempts), len(_parsed_outputs), len(_gen_seconds)
         _warnings.messages.clear()
         start = time.perf_counter()
         r = await api.post("/assistant/message", headers=auth, json={"message": step.message})
@@ -427,6 +446,8 @@ async def run() -> None:
             ok=state_ok and check_ok, detail=detail, tasks_after=len(tasks),
         )
         res.warnings = list(_warnings.messages)
+        if len(_gen_seconds) > before_gen:
+            res.gemini_wall = sum(_gen_seconds[before_gen:])
         for w in res.warnings:
             print(f"       log: {w[:200]}")
         results.append(res)
@@ -445,6 +466,9 @@ async def run() -> None:
             await api.delete(f"/tasks/{t['id']}", headers=auth)
         cleanup = f"deleted {len(final_tasks)} tasks created by this run"
     await conversation_state.clear_pending(uuid.UUID(user_id))
+    if FORCE_FALLBACK:
+        await redis_client.delete(f"gemini:exhausted:{settings.gemini_model_chain[0]}")
+        print(f"   (--force-fallback: {settings.gemini_model_chain[0]} restored)")
     await api.aclose()
 
     report = build_report(results, auth_log, total_run, cleanup)
@@ -483,8 +507,9 @@ def build_report(results: list[Result], auth_log: list[str], total_run: float, c
     lines = [
         f"# Gemini end-to-end run ({'reworded' if REWORDED else 'main'} set) - {datetime.now():%Y-%m-%d %H:%M}",
         "",
-        f"**Result: {passed}/{len(results)} steps passed.** Account: `{EMAIL}`. Model alias "
-        f"`{settings.gemini_model}` -> served by `{', '.join(versions) or 'n/a'}`.",
+        f"**Result: {passed}/{len(results)} steps passed.** Account: `{EMAIL}`. Model "
+        f"chain `{' > '.join(settings.gemini_model_chain)}` -> answered by `{', '.join(versions) or 'n/a'}`"
+        f"{' (FORCED FALLBACK: primary marked exhausted)' if FORCE_FALLBACK else ''}.",
         "",
         "## Auth",
         *[f"- {line}" for line in auth_log],
@@ -492,8 +517,12 @@ def build_report(results: list[Result], auth_log: list[str], total_run: float, c
         "## Gemini latency",
         f"- Messages that needed Gemini: **{len(gem_steps)}**; handled by Python rules with NO Gemini call: "
         f"**{len(rule_steps)}** (yes / no / number replies).",
-        f"- HTTP calls to Gemini: {len(calls)} ({retries} retries; non-200: "
+        f"- Calls per model: { {m: sum(a.model == m for a in calls) for m in dict.fromkeys(a.model for a in calls)} }.",
+        f"- HTTP calls to Gemini: {len(calls)} ({retries} extra calls from retries; non-200: "
         f"{[a.status for a in calls if a.status != 200] or 'none'}).",
+        f"- Hedging: fired on {sum('hedged duplicate' in w for r in results for w in r.warnings)} messages; "
+        f"duplicate answered first {sum('duplicate request answered first' in w for r in results for w in r.warnings)}x, "
+        f"original {sum('original request answered first' in w for r in results for w in r.warnings)}x.",
         f"- Steps failed because Gemini was down/slow: "
         f"{sum('GEMINI UNAVAILABLE' in r.detail for r in results)}. Other failures: "
         f"{sum((not r.ok) and 'GEMINI UNAVAILABLE' not in r.detail for r in results)}.",

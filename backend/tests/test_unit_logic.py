@@ -165,3 +165,39 @@ def test_task_lookup_is_deterministic_and_never_guesses():
     assert titles("meetings with the client") == ["Meeting with client"]
     assert titles("buy a spaceship") == []
     assert titles("task") == []                                    # only filler -> no match
+
+
+# --- Gemini quota replies (pure parsing, no network) --------------------------
+
+import httpx as _httpx
+
+from app.core.gemini_quota import parse_quota_error as _parse_quota
+
+
+def _quota_429(quota_id, retry_delay=None):
+    details = [{"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [{"quotaId": quota_id, "quotaValue": "20"}]}]
+    if retry_delay is not None:
+        details.append({"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay})
+    return _httpx.Response(429, json={"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": details}})
+
+
+def test_quota_parse_daily_limit_uses_googles_reset_time():
+    # Shape copied from a real 429 (gemini-3.8-flash, 2026-11-19).
+    hit = _parse_quota(_quota_429("GenerateRequestsPerDayPerProjectPerModel-FreeTier", "535s"))
+    assert (hit.kind, hit.seconds) == ("day", 535.0)
+
+
+def test_quota_parse_minute_limit_without_delay_skips_a_minute():
+    hit = _parse_quota(_quota_429("GenerateRequestsPerMinutePerProjectPerModel-FreeTier"))
+    assert (hit.kind, hit.seconds) == ("minute", 60)
+
+
+def test_quota_parse_unreadable_body_never_locks_a_model_out_long():
+    hit = _parse_quota(_httpx.Response(429, text="<html>rate limited</html>"))
+    assert (hit.kind, hit.seconds) == ("unknown", 60)
+
+
+def test_quota_parse_retired_model():
+    hit = _parse_quota(_httpx.Response(404, json={"error": {"message": "no longer available"}}))
+    assert hit.kind == "retired" and hit.seconds == 24 * 3600

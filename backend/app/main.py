@@ -6,6 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from app.core import gemini_quota
+from app.core.config import settings
 from app.core.database import engine
 from app.core.redis import redis_client
 from app.features.assistant.router import router as assistant_router
@@ -71,5 +73,9 @@ async def health() -> dict:
         checks["redis"] = "ok"
     except Exception as exc:  # pragma: no cover - reported, not swallowed
         checks["redis"] = f"error: {exc}"
+
+    # Which Gemini models are usable right now (fallback chain, in priority
+    # order) — "exhausted" ones are being skipped until their quota resets.
+    checks["gemini_models"] = await gemini_quota.status(settings.gemini_model_chain)
 
     return {"status": "ok", "checks": checks}

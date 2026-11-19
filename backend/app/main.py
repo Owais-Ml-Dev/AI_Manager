@@ -35,14 +35,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Task Manager", lifespan=lifespan)
 
-# Local-dev-only test frontend runs on a different origin (static file server).
-# Permissive on purpose — this backend isn't deployed anywhere, no real
-# production CORS boundary exists yet.
+# CORS: only origins listed in CORS_ORIGINS (default: none). Auth is a bearer
+# token in the Authorization header, not cookies, so credentials stay off.
+# Only browsers enforce this; the Android app is not affected.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(tasks_router)

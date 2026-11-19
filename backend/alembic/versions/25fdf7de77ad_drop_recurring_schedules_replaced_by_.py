@@ -29,11 +29,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # The type is created once here; the column below must not create it again
+    # (create_type=False) or the rollback fails with "type already exists".
     recurrence_type_enum.create(op.get_bind())
     op.create_table('recurring_schedules',
     sa.Column('id', sa.INTEGER(), autoincrement=True, nullable=False),
     sa.Column('task_id', sa.INTEGER(), autoincrement=False, nullable=False),
-    sa.Column('recurrence_type', postgresql.ENUM('DAILY', 'WEEKLY', 'CUSTOM_WEEKDAYS', 'CUSTOM_DATES', name='recurrence_type'), autoincrement=False, nullable=False),
+    sa.Column('recurrence_type', postgresql.ENUM('DAILY', 'WEEKLY', 'CUSTOM_WEEKDAYS', 'CUSTOM_DATES', name='recurrence_type', create_type=False), autoincrement=False, nullable=False),
     sa.Column('start_date', sa.DATE(), autoincrement=False, nullable=False),
     sa.Column('end_date', sa.DATE(), autoincrement=False, nullable=True),
     sa.Column('weekdays', postgresql.ARRAY(sa.SMALLINT()), autoincrement=False, nullable=True),

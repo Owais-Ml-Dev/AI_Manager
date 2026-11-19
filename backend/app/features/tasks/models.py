@@ -44,7 +44,7 @@ class Task(Base):
     status: Mapped[TaskStatus] = mapped_column(
         Enum(TaskStatus, name="task_status", native_enum=True),
         default=TaskStatus.PENDING,
-        server_default=TaskStatus.PENDING.value,
+        server_default=TaskStatus.PENDING.name,  # DB stores enum NAMES ('PENDING'); API uses values ('pending')
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

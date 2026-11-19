@@ -94,3 +94,30 @@ async def test_matrix_quadrants(client, auth_a, make_task):
         "delegate": ["delegate"],
         "eliminate": ["eliminate"],
     }
+
+
+# --- status default consistency (Step 1, item #8) ------------------------------
+
+async def test_status_default_matches_database_and_api(client, auth_a, user_ids, db):
+    """The DB stores enum NAMES ('PENDING'); the API speaks VALUES ('pending').
+    The model's server_default must be the DB spelling, and a row created by
+    the database default (no status given) must read back as 'pending'."""
+    from sqlalchemy import text
+
+    from app.features.tasks.models import Task
+
+    assert Task.__table__.c.status.server_default.arg == "PENDING"
+    db_default = (await db.execute(text(
+        "select column_default from information_schema.columns "
+        "where table_schema='public' and table_name='tasks' and column_name='status'"
+    ))).scalar()
+    assert db_default.startswith("'PENDING'")
+
+    task_id = (await db.execute(text(
+        "insert into tasks (user_id, title, category, urgent, important, created_at, updated_at) "
+        "values (:uid, 'raw default', 'ONE_TIME', false, false, now(), now()) returning id"
+    ), {"uid": user_ids["a"]})).scalar()
+    await db.commit()
+    response = await client.get(f"/tasks/{task_id}", headers=auth_a)
+    assert response.status_code == 200
+    assert response.json()["status"] == "pending"

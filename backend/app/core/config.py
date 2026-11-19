@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     def gemini_model_chain(self) -> list[str]:
         return [m.strip() for m in self.gemini_models.split(",") if m.strip()]
 
+    # Browser origins allowed to call this API (comma-separated), e.g.
+    # "http://localhost:5173,https://app.example.com". Empty = no browser
+    # origin allowed. Only browsers enforce CORS — the Android app, curl and
+    # tests are unaffected — so this matters once a web frontend exists.
+    cors_origins: str = ""
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip().rstrip("/") for o in self.cors_origins.split(",") if o.strip()]
+
     # Supabase project URL, used to fetch its public JWKS for verifying
     # Supabase Auth access tokens. Not a secret.
     supabase_url: str
